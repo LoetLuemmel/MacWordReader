@@ -14,7 +14,9 @@ static long ReadAt(void *ctx, wr_u32 off, wr_u8 *buf, long n)
     return (long)fread(buf, 1, (size_t)n, f);
 }
 
-static int raw = 0;
+static int raw = 0, fmt = 0;
+static int skip = 0;              /* paragraph record bytes still to come */
+static wr_u8 rec[DOCX_PARA_LEN];
 static long Write(void *ctx, const wr_u8 *b, long n)
 {
     long i;
@@ -22,7 +24,17 @@ static long Write(void *ctx, const wr_u8 *b, long n)
     for (i = 0; i < n; i++) {
         wr_u8 c = b[i];
         if (raw) { putchar(c); continue; }
-        if (c == '\r') { putchar('\n'); continue; }
+        if (skip) {                               /* a record may straddle two writes */
+            rec[DOCX_PARA_LEN - skip] = c;
+            if (--skip == 0 && fmt)
+                printf("{P b%d a%d l%d f%d j%d}", rec[1] - 32, rec[2] - 32, (rec[3] - 32) * 2,
+                       (rec[4] - 32 - 100) * 2, rec[5] - 32);
+            continue;
+        }
+        if (c == DOCX_PARA) { skip = DOCX_PARA_LEN - 1; rec[0] = c; continue; }
+        if (DOCX_IS_FACE(c)) { if (fmt) printf("{%s%s%s%s}", c == 0x10 ? "plain" : "", c & 1 ? "B" : "", c & 2 ? "I" : "", c & 4 ? "U" : ""); continue; }
+        if (DOCX_IS_SIZE(c)) { if (fmt) printf("{s%+d}", c - DOCX_SIZE0 - 2); continue; }
+        if (c == '\r' || c == DOCX_CH_LINEBREAK) { putchar('\n'); continue; }
         if (c == DOCX_CH_EURO) { fputs("\xE2\x82\xAC", stdout); continue; }
         if (DOCX_IS_MARKER(c)) { fputs(c == 1 ? "#T " : c == 2 ? "# " : c == 3 ? "## " : "### ", stdout); continue; }
         {
@@ -43,6 +55,7 @@ int main(int argc, char **argv)
     short err;
     const char *path = argv[argc - 1];
     if (argc > 2 && strcmp(argv[1], "-raw") == 0) raw = 1;
+    if (argc > 2 && strcmp(argv[1], "-fmt") == 0) fmt = 1;
     f = fopen(path, "rb");
     if (!f) { perror(path); return 2; }
     fseek(f, 0, SEEK_END);
