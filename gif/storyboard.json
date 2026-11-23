@@ -136,6 +136,18 @@
   "caption": "System 7 has no € in Mac OS Roman or in any bitmap font, so WordReader draws it with QuickDraw: an open arc and two bars, as wide as a digit."
  },
  {
+  "file": "duo/141644_07_copy.png",
+  "tag": "PowerBook Duo",
+  "crop": [
+   0,
+   0,
+   580,
+   440
+  ],
+  "seconds": 4.0,
+  "caption": "Select and copy: drag, Shift-click or double-click, then ⌘C puts plain MacRoman text on the clipboard (€ as EUR), ready to paste into TeachText."
+ },
+ {
   "card": "Done",
   "seconds": 4.0,
   "lines": [
