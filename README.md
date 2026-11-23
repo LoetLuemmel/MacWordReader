@@ -81,3 +81,7 @@ MPW notes learned here: `Fixed` is a Toolbox type (don't name a function
 that); UI 3.4 moved control part codes and `scrollBarProc` to
 ControlDefinitions.h; Rez Pascal strings stop at 255 characters; a running app
 holds its file — quit it (`aevt/quit`) before relinking.
+
+## License
+
+MIT — see [LICENSE](LICENSE). © 2026 !Beaker (pitfo(AT)hotmail.de)
