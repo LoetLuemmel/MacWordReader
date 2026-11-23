@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<?mso-application progid="Word.Document"?>
+<w:wordDocument xmlns:w="http://schemas.microsoft.com/office/word/2003/wordml"><w:body>
+<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Word 2003 XML</w:t></w:r></w:p>
+<w:p><w:r><w:t xml:space="preserve">Grüße &amp; &#8364;5 &#x201E;ok&#x201C; <![CDATA[x]y]]></w:t></w:r><w:r><w:tab/><w:t>Tab</w:t></w:r><!-- a > comment --></w:p>
+</w:body></w:wordDocument>
