@@ -32,6 +32,9 @@
 #include <SegLoad.h>
 #include <TextUtils.h>
 #include <Errors.h>
+#include <Scrap.h>
+#include <Sound.h>
+#include <LowMem.h>
 
 #include "docx.h"
 #include "zipdir.h"
@@ -65,7 +68,11 @@ QDGlobals qd;
 #define iSaveText     4
 #define iInfo         6
 #define iQuit         8
+#define iUndo         1
+#define iCut          3
 #define iCopy         4
+#define iPaste        5
+#define iClear        6
 #define iSelectAll    7
 #define rAlertError   128
 #define rAlertAbout   129
@@ -93,6 +100,9 @@ typedef struct {
     DocxStats     st;
     short         truncated;
     long          ticks;     /* conversion time */
+    long          selStart;  /* selection: text offsets, selStart <= selEnd */
+    long          selEnd;
+    Boolean       active;    /* front and not suspended: show the selection */
 } DocRec, *DocPtr;
 
 /* per-style metrics for the current text size */
@@ -511,7 +521,88 @@ done:
 
 /* --------------------------------------------------------------- drawing */
 
-static void DrawDoc(WindowPtr w)
+/* x of text offset pos on line lr, from the text's left edge */
+static short LineX(const unsigned char *t, const LineRec *lr, long pos)
+{
+    const StyleMetrics *m = &gMetrics[lr->style];
+    short x = 0;
+    long k;
+    for (k = lr->start; k < pos && k < lr->start + lr->len; k++)
+        x += (t[k] == '\t') ? (short)(NextTab(x) - x) : m->widths[t[k]];
+    return x;
+}
+
+/* text offset nearest to x on line lr */
+static long LinePos(const unsigned char *t, const LineRec *lr, short hx)
+{
+    const StyleMetrics *m = &gMetrics[lr->style];
+    short x = 0, cw;
+    long k;
+    for (k = lr->start; k < lr->start + lr->len; k++) {
+        cw = (t[k] == '\t') ? (short)(NextTab(x) - x) : m->widths[t[k]];
+        if (hx < x + cw / 2)
+            return k;
+        x += cw;
+    }
+    return lr->start + lr->len;
+}
+
+/* Draw line i whose bottom is at y; erase first if asked. The selection is
+   inverted in the highlight colour; it runs to the right edge when it
+   continues onto the next line, as in TextEdit. */
+static void DrawLine(WindowPtr w, DocPtr d, const unsigned char *t, long i, short y,
+                     const Rect *r, Boolean erase)
+{
+#pragma unused(w)
+    LineRec *lr = (LineRec *)*d->lines + i;
+    StyleMetrics *m = &gMetrics[lr->style];
+    short segStart = 0, k, top = (short)(y - LineHeight(lr));
+    long a = lr->start, b = lr->start + lr->len;
+    long next = (i + 1 < d->nLines) ? ((LineRec *)*d->lines)[i + 1].start : d->len + 1;
+    Rect lineR;
+
+    SetRect(&lineR, r->left, top, r->right, y);
+    if (erase)
+        EraseRect(&lineR);
+    SetStyle(lr->style);
+    /* baseline: the line's top, the air above a heading, then the ascent */
+    MoveTo((short)(r->left + kMargin),
+           (short)(top + m->ascent + (lr->style != kStyleBody ? gBaseSize / 2 : 0)));
+    for (k = 0; k <= lr->len; k++) {
+        unsigned char c = (k < lr->len) ? t[lr->start + k] : 0;
+        if (k == lr->len || c == '\t' || m->missing[c]) {
+            if (k > segStart)
+                DrawText((Ptr)(t + lr->start), segStart, (short)(k - segStart));
+            if (k < lr->len && c == '\t') {
+                Point pt;
+                GetPen(&pt);
+                MoveTo((short)(r->left + kMargin + NextTab((short)(pt.h - r->left - kMargin))), pt.v);
+            } else if (k < lr->len && c == DOCX_CH_EURO) {
+                DrawEuro(m->widths[c], m->ascent, (Boolean)(m->face != 0));
+            } else if (k < lr->len) {
+                const char *sub = GlyphStandIn(c);
+                short n = 0;
+                while (sub[n])
+                    n++;
+                DrawText((Ptr)sub, 0, n);
+            }
+            segStart = (short)(k + 1);
+        }
+    }
+    if (d->active && d->selEnd > d->selStart && d->selStart < next && d->selEnd > a) {
+        Rect h = lineR;
+        h.left = (short)(r->left + kMargin + (d->selStart <= a ? 0 : LineX(t, lr, d->selStart)));
+        if (d->selStart <= a && i > 0)
+            h.left = r->left;
+        if (d->selEnd <= b)
+            h.right = (short)(r->left + kMargin + LineX(t, lr, d->selEnd));
+        LMSetHiliteMode((UInt8)(LMGetHiliteMode() & 0x7F));   /* highlight colour */
+        InvertRect(&h);
+    }
+}
+
+/* Redraw the visible lines touching text offsets [from, to]; from < 0: all. */
+static void DrawLines(WindowPtr w, long from, long to)
 {
     DocPtr d = DocOf(w);
     Rect r;
@@ -527,51 +618,31 @@ static void DrawDoc(WindowPtr w)
     saveClip = NewRgn();
     GetClip(saveClip);
     ClipRect(&r);
-    EraseRect(&r);
-
+    if (from < 0)
+        EraseRect(&r);
     HLock(d->text);
     HLock(d->lines);
     t = (unsigned char *)*d->text;
     y = (short)(r.top + kMargin / 2);
     for (i = d->top; i < d->nLines && y < r.bottom; i++) {
         LineRec *lr = (LineRec *)*d->lines + i;
-        StyleMetrics *m = &gMetrics[lr->style];
-        short x = 0, segStart = 0, k;
+        long next = (i + 1 < d->nLines) ? lr[1].start : d->len + 1;
         y += LineHeight(lr);
-        SetStyle(lr->style);
-        /* baseline: the line's top, the air above a heading, then the ascent */
-        MoveTo((short)(r.left + kMargin),
-               (short)(y - LineHeight(lr) + m->ascent + (lr->style != kStyleBody ? gBaseSize / 2 : 0)));
-        for (k = 0; k <= lr->len; k++) {
-            unsigned char c = (k < lr->len) ? t[lr->start + k] : 0;
-            if (k == lr->len || c == '\t' || m->missing[c]) {
-                if (k > segStart)
-                    DrawText((Ptr)(t + lr->start), segStart, (short)(k - segStart));
-                if (k < lr->len && c == '\t') {
-                    short pen;
-                    Point pt;
-                    GetPen(&pt);
-                    pen = (short)(pt.h - r.left - kMargin);
-                    x = NextTab(pen);
-                    MoveTo((short)(r.left + kMargin + x), pt.v);
-                } else if (k < lr->len && c == DOCX_CH_EURO) {
-                    DrawEuro(m->widths[c], m->ascent, (Boolean)(m->face != 0));
-                } else if (k < lr->len) {
-                    const char *sub = GlyphStandIn(c);
-                    short n = 0;
-                    while (sub[n])
-                        n++;
-                    DrawText((Ptr)sub, 0, n);
-                }
-                segStart = (short)(k + 1);
-            }
-        }
+        if (from < 0)
+            DrawLine(w, d, t, i, y, &r, false);
+        else if (from < next && to >= lr->start)
+            DrawLine(w, d, t, i, y, &r, true);
     }
     HUnlock(d->lines);
     HUnlock(d->text);
     SetStyle(kStyleBody);
     SetClip(saveClip);
     DisposeRgn(saveClip);
+}
+
+static void DrawDoc(WindowPtr w)
+{
+    DrawLines(w, -1, 0);
 }
 
 static void DrawWindow(WindowPtr w)
@@ -624,6 +695,185 @@ static pascal void ScrollAction(ControlHandle c, short part)
     default: return;
     }
     ScrollTo(w, d->top + delta);
+}
+
+/* ------------------------------------------------------------ selection */
+
+/* Text offset under a point in the window (local coordinates). */
+static long PointToPos(WindowPtr w, Point pt)
+{
+    DocPtr d = DocOf(w);
+    Rect r;
+    long i, pos;
+    short y;
+    LineRec *lr;
+    if (d == 0 || d->nLines == 0)
+        return 0;
+    ContentRect(w, &r);
+    y = (short)(r.top + kMargin / 2);
+    i = d->top;
+    if (pt.v >= y) {
+        for (; i < d->nLines; i++) {
+            y += LineHeight((LineRec *)*d->lines + i);
+            if (pt.v < y)
+                break;
+        }
+        if (i >= d->nLines) {
+            lr = (LineRec *)*d->lines + d->nLines - 1;
+            return lr->start + lr->len;
+        }
+    }
+    HLock(d->text);
+    lr = (LineRec *)*d->lines + i;
+    pos = LinePos((unsigned char *)*d->text, lr, (short)(pt.h - r.left - kMargin));
+    HUnlock(d->text);
+    return pos;
+}
+
+static Boolean IsWordChar(unsigned char c)
+{
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
+        return true;
+    if (c == DOCX_CH_EURO)
+        return true;
+    if (c < 0x80)
+        return false;
+    /* MacRoman upper half: letters, except the punctuation among them */
+    return !((c >= 0xC7 && c <= 0xC9) || (c >= 0xD0 && c <= 0xD5) ||
+             c == 0xE2 || c == 0xE3 || c == 0xA5 || c == 0xCA);
+}
+
+static void WordAt(DocPtr d, long pos, long *a, long *b)
+{
+    unsigned char *t = (unsigned char *)*d->text;
+    *a = *b = pos;
+    while (*a > 0 && IsWordChar(t[*a - 1]))
+        (*a)--;
+    while (*b < d->len && IsWordChar(t[*b]))
+        (*b)++;
+}
+
+/* Change the selection, redrawing only the lines whose highlight changes. */
+static void SetSel(WindowPtr w, long s, long e)
+{
+    DocPtr d = DocOf(w);
+    long os, oe;
+    if (d == 0)
+        return;
+    if (s > e) { long x = s; s = e; e = x; }
+    if (s < 0) s = 0;
+    if (e > d->len) e = d->len;
+    os = d->selStart;
+    oe = d->selEnd;
+    if (s == os && e == oe)
+        return;
+    d->selStart = s;
+    d->selEnd = e;
+    if (os == oe && s == e)
+        return;                                 /* nothing shown before or after */
+    if (s == os && os != oe && s != e)
+        DrawLines(w, e < oe ? e : oe, e < oe ? oe : e);
+    else if (e == oe && os != oe && s != e)
+        DrawLines(w, s < os ? s : os, s < os ? os : s);
+    else
+        DrawLines(w, s < os ? s : os, e > oe ? e : oe);
+}
+
+static void TrackSelection(WindowPtr w, EventRecord *ev, Point pt)
+{
+    static long lastWhen = 0;
+    static Point lastPt;
+    DocPtr d = DocOf(w);
+    Rect r;
+    long pos, a0, b0, a, b, lastScroll = 0;
+    Boolean words;
+
+    if (d == 0)
+        return;
+    ContentRect(w, &r);
+    pos = PointToPos(w, pt);
+    words = (ev->when - lastWhen <= GetDblTime()) &&
+            pt.h - lastPt.h < 4 && lastPt.h - pt.h < 4 &&
+            pt.v - lastPt.v < 4 && lastPt.v - pt.v < 4;
+    lastWhen = ev->when;
+    lastPt = pt;
+    if (words) {
+        WordAt(d, pos, &a0, &b0);
+    } else if (ev->modifiers & shiftKey) {     /* extend from the far end */
+        a0 = b0 = (pos < d->selStart) ? d->selEnd : d->selStart;
+    } else {
+        a0 = b0 = pos;
+    }
+    do {
+        if (pt.v < r.top || pt.v > r.bottom) {
+            if (TickCount() - lastScroll >= 4) {
+                ScrollTo(w, d->top + (pt.v < r.top ? -1 : 1));
+                lastScroll = TickCount();
+            }
+        }
+        pos = PointToPos(w, pt);
+        if (words) {
+            WordAt(d, pos, &a, &b);
+            SetSel(w, a < a0 ? a : a0, b > b0 ? b : b0);
+        } else {
+            SetSel(w, pos < a0 ? pos : a0, pos > b0 ? pos : b0);
+        }
+        GetMouse(&pt);
+    } while (StillDown());
+}
+
+/* Edit > Copy: the selection as plain MacRoman text, like Save as Text. */
+static void DoCopy(WindowPtr w)
+{
+    DocPtr d = DocOf(w);
+    Handle h;
+    long i, n = 0, need = 0;
+    unsigned char *t, *o;
+    if (d == 0 || d->selEnd <= d->selStart)
+        return;
+    t = (unsigned char *)*d->text;
+    for (i = d->selStart; i < d->selEnd; i++)
+        need += (t[i] == DOCX_CH_EURO) ? 3 : DOCX_IS_MARKER(t[i]) ? 0 : 1;
+    h = NewHandle(need);
+    if (h == 0) {
+        SysBeep(1);
+        return;
+    }
+    HLock(h);
+    HLock(d->text);
+    t = (unsigned char *)*d->text;
+    o = (unsigned char *)*h;
+    for (i = d->selStart; i < d->selEnd; i++) {
+        unsigned char c = t[i];
+        if (c == DOCX_CH_EURO) {
+            o[n++] = 'E'; o[n++] = 'U'; o[n++] = 'R';
+        } else if (!DOCX_IS_MARKER(c))
+            o[n++] = c;
+    }
+    HUnlock(d->text);
+    ZeroScrap();
+    if (PutScrap(n, 'TEXT', (Ptr)*h) != noErr)
+        SysBeep(1);
+    DisposeHandle(h);
+}
+
+static void AdjustCursor(Point where)
+{
+    WindowPtr w = FrontWindow();
+    Rect r;
+    if (DocOf(w)) {
+        GrafPtr save;
+        GetPort(&save);
+        SetPort(w);
+        GlobalToLocal(&where);
+        ContentRect(w, &r);
+        SetPort(save);
+        if (PtInRect(where, &r)) {
+            SetCursor(*GetCursor(iBeamCursor));
+            return;
+        }
+    }
+    InitCursor();
 }
 
 /* ------------------------------------------------------------ documents */
@@ -927,7 +1177,22 @@ static void AdjustMenus(void)
     if (w) EnableItem(file, iClose); else DisableItem(file, iClose);
     if (isDoc) { EnableItem(file, iSaveText); EnableItem(file, iInfo); }
     else { DisableItem(file, iSaveText); DisableItem(file, iInfo); }
-    if (isDA) EnableItem(edit, 0); else DisableItem(edit, 0);
+    if (isDA) {
+        short i;
+        EnableItem(edit, 0);
+        for (i = iUndo; i <= iSelectAll; i++)
+            EnableItem(edit, i);
+    } else if (isDoc) {
+        DocPtr d = DocOf(w);
+        EnableItem(edit, 0);
+        DisableItem(edit, iUndo);
+        DisableItem(edit, iCut);
+        DisableItem(edit, iPaste);              /* a reader: nothing to paste into */
+        DisableItem(edit, iClear);
+        if (d->selEnd > d->selStart) EnableItem(edit, iCopy); else DisableItem(edit, iCopy);
+        EnableItem(edit, iSelectAll);
+    } else
+        DisableItem(edit, 0);
     DrawMenuBar();
 }
 
@@ -985,7 +1250,14 @@ static void DoMenu(long mr)
         }
         break;
     case mEdit:
-        SystemEdit((short)(item - 1));
+        if (!SystemEdit((short)(item - 1))) {
+            WindowPtr w = FrontWindow();
+            DocPtr d = DocOf(w);
+            if (d && item == iCopy)
+                DoCopy(w);
+            else if (d && item == iSelectAll)
+                SetSel(w, 0, d->len);
+        }
         break;
     case mView:
         SetTextSize(item);
@@ -1066,6 +1338,8 @@ static void DoMouseDown(EventRecord *ev)
                 } else if (cpart) {
                     TrackControl(c, pt, gScrollUPP);
                 }
+            } else if (d) {
+                TrackSelection(w, ev, pt);
             }
         }
         break;
@@ -1098,8 +1372,14 @@ static void DoActivate(WindowPtr w, Boolean on)
 {
     DocPtr d = DocOf(w);
     SetPort(w);
-    if (d)
+    if (d) {
         HiliteControl(d->vbar, on ? 0 : 255);
+        if (d->active != on) {
+            d->active = on;
+            if (d->selEnd > d->selStart)
+                DrawLines(w, d->selStart, d->selEnd);
+        }
+    }
     DrawGrowIcon(w);
 }
 
@@ -1189,8 +1469,10 @@ int main(void)
     InstallAEs();
 
     while (!gQuit) {
-        if (!WaitNextEvent(everyEvent, &ev, 30, 0))
+        if (!WaitNextEvent(everyEvent, &ev, 10, 0)) {
+            AdjustCursor(ev.where);
             continue;
+        }
         switch (ev.what) {
         case mouseDown:
             DoMouseDown(&ev);

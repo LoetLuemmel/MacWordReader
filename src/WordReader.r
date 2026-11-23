@@ -49,7 +49,9 @@ resource 'MENU' (130) {
       "Cut", noIcon, "X", noMark, plain;
       "Copy", noIcon, "C", noMark, plain;
       "Paste", noIcon, "V", noMark, plain;
-      "Clear", noIcon, noKey, noMark, plain }
+      "Clear", noIcon, noKey, noMark, plain;
+      "-", noIcon, noKey, noMark, plain;
+      "Select All", noIcon, "A", noMark, plain }
 };
 
 resource 'MENU' (131) {
