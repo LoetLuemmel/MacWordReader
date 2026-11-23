@@ -16,7 +16,8 @@ Interfaces 3.4) on the dev2019 guest, deployed to the Duo over AppleBridge.
 Shown: paragraphs, headings (Title, Heading 1–3, also German *Überschrift*),
 bullets and list levels, tables (cells tab-separated, rows per line), tabs and
 line breaks, a `[Picture]` marker for images. File ▸ Save as Text writes a
-TeachText file (MacRoman, CR). File ▸ Document Info reports what the
+TeachText file (MacRoman, CR). Text can be selected (drag, Shift-click, double-click
+for words, ⌘A) and copied (⌘C) to the clipboard as plain MacRoman text. File ▸ Document Info reports what the
 conversion had to do.
 
 ## The code-table problem, three layers deep
