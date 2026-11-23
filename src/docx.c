@@ -21,9 +21,11 @@
 #include "zipdir.h"
 #include "macroman.h"
 
-#define TAGMAX 200
+#define TAGMAX 600          /* ODF style tags carry many attributes */
 
 enum { M_TEXT, M_TAG, M_COMMENT, M_CDATA };
+
+struct OdfCtx;
 
 typedef struct {
     WrWriteFn  wr;
@@ -57,7 +59,57 @@ typedef struct {
     short  isList, listLevel;
     short  cellSep;         /* a cell's earlier paragraph wants a space */
     short  pendTab;         /* a closed cell wants a tab before more text */
+
+    /* formatting: defaults from styles.xml, lists from numbering.xml */
+    short  inPPr, inRPr, inDocDef, inDefStyle;
+    short  defSz;           /* body text size, half-points */
+    long   defBefore, defAfter;          /* twips */
+    long   before, after, left, first;   /* this paragraph, twips */
+    short  align, hasInd, numId, paraRec;
+    short  runFace, runSz;  /* the current run */
+    short  emFace, emStep;  /* what the output says right now */
+    short  curAbs, curLvl, curNum;
+    short  nLvl, nNum;
+    struct { short abs, lvl, left, hang; } lvls[64];
+    struct { short num, abs; } nums[64];
+
+    struct OdfCtx *odf;     /* set while reading OpenDocument */
 } Parser;
+
+/* ---------- OpenDocument: styles resolved through their parents ---------- */
+
+#define OH_BEFORE 1
+#define OH_AFTER  2
+#define OH_LEFT   4
+#define OH_FIRST  8
+#define OH_ALIGN  16
+#define OH_SZ     32
+#define ODF_MAXSTYLES 160
+
+typedef struct {
+    char   name[32], parent[32];
+    char   family;                  /* 'p' paragraph, 't' text */
+    wr_u8  marker;                  /* heading look from the style's name */
+    short  has;                     /* OH_* */
+    long   before, after, left, first;     /* twips */
+    short  align;
+    short  faceMask, faceVal;
+    short  sz;                      /* half-points; < 0: percent of the parent */
+} OdfStyle;
+
+typedef struct OdfCtx {
+    OdfStyle s[ODF_MAXSTYLES];
+    short  n;
+    short  cur;                     /* style being read; -2: the default style; -1: none */
+    short  listDepth, itemFresh;
+    short  spanDepth;
+    short  stackFace[8], stackSz[8];
+    short  frameLevel;              /* skipDepth inside the current draw:frame */
+    short  space;                   /* last output was collapsible white space */
+} OdfCtx;
+
+static short AttrVal(const char *tag, const char *attr, char *val, short max);
+static short Eq(const char *a, const char *b);
 
 /* ---------- output ---------- */
 
@@ -87,6 +139,80 @@ static void EmitStr(Parser *p, const char *s)
         Emit(p, (wr_u8)*s++);
 }
 
+static wr_u8 Clamp200(long v)
+{
+    return (wr_u8)(0x20 + (v < 0 ? 0 : v > 200 ? 200 : v));
+}
+
+/* The paragraph record: spacing, indents, alignment (see docx.h). */
+static void EmitParaRec(Parser *p)
+{
+    long left = p->left, first = p->first;
+    short i;
+    if (p->paraRec || p->tblDepth > 0)
+        return;
+    p->paraRec = 1;
+    if (p->isList && !p->hasInd) {
+        left = 720L * (p->listLevel + 1);     /* Word's default list indents */
+        first = -360;
+        for (i = 0; i < p->nNum; i++)
+            if (p->nums[i].num == p->numId) {
+                short k;
+                for (k = 0; k < p->nLvl; k++)
+                    if (p->lvls[k].abs == p->nums[i].abs && p->lvls[k].lvl == p->listLevel) {
+                        left = p->lvls[k].left;
+                        first = -p->lvls[k].hang;
+                    }
+                break;
+            }
+    }
+    Emit(p, DOCX_PARA);
+    Emit(p, Clamp200(p->before / 20));
+    Emit(p, Clamp200(p->after / 20));
+    Emit(p, Clamp200(left / 40));
+    Emit(p, Clamp200(first / 40 + 100));
+    Emit(p, (wr_u8)(0x20 + p->align));
+    p->st->chars -= DOCX_PARA_LEN;
+}
+
+static short SizeStep(short sz, short def)
+{
+    long r;
+    if (sz <= 0 || def <= 0)
+        return 0;
+    r = (long)sz * 100 / def;
+    return (short)(r < 80 ? -2 : r < 95 ? -1 : r < 112 ? 0 : r < 130 ? 1 :
+                   r < 155 ? 2 : r < 180 ? 3 : r < 220 ? 4 : 5);
+}
+
+/* Bring the output's run face and size in line with the current run.
+   Headings keep their style's look. */
+static void ApplyRun(Parser *p)
+{
+    short step;
+    if (p->marker && p->tblDepth == 0)
+        return;
+    step = SizeStep(p->runSz, p->defSz);
+    if (p->runFace != p->emFace) {
+        Emit(p, (wr_u8)(DOCX_FACE0 + p->runFace));
+        p->emFace = p->runFace;
+        p->st->chars--;
+    }
+    if (step != p->emStep) {
+        Emit(p, (wr_u8)(DOCX_SIZE0 + step + 2));
+        p->emStep = step;
+        p->st->chars--;
+    }
+}
+
+/* A CR: a new paragraph for the viewer, which starts plain again. */
+static void EmitCR(Parser *p)
+{
+    Emit(p, '\r');
+    p->emFace = 0;
+    p->emStep = 0;
+}
+
 /* Called before any visible content of a paragraph. */
 static void StartContent(Parser *p)
 {
@@ -102,17 +228,20 @@ static void StartContent(Parser *p)
             p->cellSep = 0;
         }
     }
-    if (p->paraStarted)
-        return;
-    p->paraStarted = 1;
-    if (p->marker && p->tblDepth == 0)
-        Emit(p, p->marker);
-    if (p->isList) {
-        for (i = 0; i < p->listLevel && i < 8; i++)
-            EmitStr(p, "   ");
-        Emit(p, 0xA5);        /* MacRoman bullet */
-        Emit(p, ' ');
+    if (!p->paraStarted) {
+        p->paraStarted = 1;
+        EmitParaRec(p);
+        if (p->marker && p->tblDepth == 0)
+            Emit(p, p->marker);
+        if (p->isList) {
+            if (p->tblDepth > 0)
+                for (i = 0; i < p->listLevel && i < 8; i++)
+                    EmitStr(p, "   ");
+            Emit(p, 0xA5);        /* MacRoman bullet, then a tab to the hanging indent */
+            Emit(p, (wr_u8)(p->tblDepth > 0 ? ' ' : '\t'));
+        }
     }
+    ApplyRun(p);
 }
 
 static void EmitCodePoint(Parser *p, wr_u32 cp)
@@ -123,6 +252,15 @@ static void EmitCodePoint(Parser *p, wr_u32 cp)
 
     if (p->skipDepth > 0 || !p->inT)
         return;
+    if (p->odf) {                       /* ODF: runs of white space are one space */
+        if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r') {
+            if (p->odf->space)
+                return;
+            p->odf->space = 1;
+            cp = ' ';
+        } else
+            p->odf->space = 0;
+    }
     if (cp < 0x20) {
         if (cp == 0x09)
             cp = '\t';
@@ -295,10 +433,548 @@ static void EndParagraph(Parser *p)
         if (p->paraStarted)
             p->cellSep = 1;
     } else {
-        Emit(p, '\r');
+        EmitParaRec(p);
+        EmitCR(p);
     }
     p->inPara = 0;
     p->paraStarted = 0;
+}
+
+static long AttrNum(const char *tag, const char *attr, long def)
+{
+    char v[24];
+    long n = 0;
+    short i = 0, neg = 0;
+    if (!AttrVal(tag, attr, v, sizeof(v)) || v[0] == 0)
+        return def;
+    if (v[0] == '-') {
+        neg = 1;
+        i = 1;
+    }
+    if (v[i] < '0' || v[i] > '9')
+        return def;
+    for (; v[i] >= '0' && v[i] <= '9'; i++)
+        n = n * 10 + (v[i] - '0');
+    return neg ? -n : n;
+}
+
+/* On/off properties: <w:b/>, <w:b w:val="0"/>, <w:u w:val="none"/> */
+static short AttrOn(const char *tag)
+{
+    char v[16];
+    if (!AttrVal(tag, "val", v, sizeof(v)))
+        return 1;
+    return !(Eq(v, "0") || Eq(v, "false") || Eq(v, "off") || Eq(v, "none"));
+}
+
+static short Contains(const char *s, const char *key)
+{
+    short i, k;
+    for (i = 0; s[i]; i++) {
+        for (k = 0; key[k]; k++) {
+            char c = s[i + k];
+            if (c >= 'A' && c <= 'Z')
+                c = (char)(c + 32);
+            if (c != key[k])
+                break;
+        }
+        if (key[k] == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* Paragraph and run properties, document defaults (styles.xml) and list
+   indents (numbering.xml). Returns 1 when the tag was one of them. */
+static short HandleFormat(Parser *p, const char *name, short closing, short selfClose)
+{
+    char v[48];
+    long n;
+    short bit = 0;
+
+    if (Eq(name, "pPr")) { if (!selfClose) p->inPPr = (short)!closing; return 1; }
+    if (Eq(name, "rPr")) { if (!selfClose) p->inRPr = (short)!closing; return 1; }
+    if (Eq(name, "docDefaults")) { if (!selfClose) p->inDocDef = (short)!closing; return 1; }
+    if (Eq(name, "style")) {
+        if (closing)
+            p->inDefStyle = 0;
+        else if (!selfClose) {
+            short para;
+            AttrVal(p->tag, "type", v, sizeof(v));
+            para = Eq(v, "paragraph");
+            AttrVal(p->tag, "default", v, sizeof(v));
+            p->inDefStyle = (short)(para && (Eq(v, "1") || Eq(v, "true") || Eq(v, "on")));
+        }
+        return 1;
+    }
+    if (Eq(name, "abstractNum")) {
+        p->curAbs = (short)(closing || selfClose ? -1 : AttrNum(p->tag, "abstractNumId", -1));
+        return 1;
+    }
+    if (Eq(name, "lvl")) {
+        p->curLvl = (short)(closing || selfClose ? -1 : AttrNum(p->tag, "ilvl", -1));
+        return 1;
+    }
+    if (Eq(name, "num")) {
+        p->curNum = (short)(closing || selfClose ? -1 : AttrNum(p->tag, "numId", -1));
+        return 1;
+    }
+    if (closing)
+        return 0;
+    if (Eq(name, "abstractNumId") && p->curNum >= 0) {
+        if (p->nNum < 64) {
+            p->nums[p->nNum].num = p->curNum;
+            p->nums[p->nNum].abs = (short)AttrNum(p->tag, "val", -1);
+            p->nNum++;
+        }
+        return 1;
+    }
+    if (Eq(name, "spacing")) {
+        if (p->inRPr)
+            return 1;                       /* character spacing */
+        if (p->inPara && p->inPPr) {
+            p->before = AttrNum(p->tag, "before", p->before);
+            p->after = AttrNum(p->tag, "after", p->after);
+        } else if (p->inDocDef || p->inDefStyle) {
+            p->defBefore = AttrNum(p->tag, "before", p->defBefore);
+            p->defAfter = AttrNum(p->tag, "after", p->defAfter);
+        }
+        return 1;
+    }
+    if (Eq(name, "ind")) {
+        long left = AttrNum(p->tag, "left", AttrNum(p->tag, "start", -1));
+        long hang = AttrNum(p->tag, "hanging", -1), fl = AttrNum(p->tag, "firstLine", -1);
+        if (p->inRPr)
+            return 1;
+        if (p->curAbs >= 0 && p->curLvl >= 0) {
+            if (p->nLvl < 64) {
+                p->lvls[p->nLvl].abs = p->curAbs;
+                p->lvls[p->nLvl].lvl = p->curLvl;
+                p->lvls[p->nLvl].left = (short)(left < 0 ? 0 : left > 20000 ? 20000 : left);
+                p->lvls[p->nLvl].hang = (short)(hang > 0 && hang < 20000 ? hang : 0);
+                p->nLvl++;
+            }
+        } else if (p->inPara && p->inPPr) {
+            if (left >= 0)
+                p->left = left;
+            if (hang >= 0)
+                p->first = -hang;
+            else if (fl >= 0)
+                p->first = fl;
+            p->hasInd = 1;
+        }
+        return 1;
+    }
+    if (Eq(name, "jc")) {
+        if (p->inPara && p->inPPr && !p->inRPr) {
+            AttrVal(p->tag, "val", v, sizeof(v));
+            p->align = (short)(Eq(v, "center") ? DOCX_AL_CENTER :
+                               (Eq(v, "right") || Eq(v, "end")) ? DOCX_AL_RIGHT :
+                               (Eq(v, "both") || Eq(v, "distribute")) ? DOCX_AL_JUSTIFY : DOCX_AL_LEFT);
+        }
+        return 1;
+    }
+    if (Eq(name, "numId")) {
+        if (p->inPara && p->inPPr)
+            p->numId = (short)AttrNum(p->tag, "val", -1);
+        p->isList = 1;
+        return 1;
+    }
+    if (Eq(name, "sz")) {
+        n = AttrNum(p->tag, "val", 0);
+        if (p->inRPr && p->runDepth > 0)
+            p->runSz = (short)n;
+        else if (p->inRPr && (p->inDocDef || p->inDefStyle) && n > 0)
+            p->defSz = (short)n;
+        return 1;
+    }
+    if (!(p->inRPr && p->runDepth > 0))
+        return 0;
+    if (Eq(name, "b")) bit = 1;
+    else if (Eq(name, "i")) bit = 2;
+    else if (Eq(name, "u")) bit = 4;
+    else if (Eq(name, "rStyle")) {
+        AttrVal(p->tag, "val", v, sizeof(v));
+        if (Contains(v, "strong") || Contains(v, "fett"))
+            p->runFace |= 1;
+        if (Contains(v, "emphasis") || Contains(v, "hervorhebung"))
+            p->runFace |= 2;
+        return 1;
+    } else
+        return 0;
+    if (AttrOn(p->tag))
+        p->runFace |= bit;
+    else
+        p->runFace &= ~bit;
+    return 1;
+}
+
+/* An ODF length ("0.423cm", "12pt", "0.5in", "2mm") in twips; 0 if none. */
+static long OdfLen(const char *v)
+{
+    long whole = 0, frac = 0, div = 1, num, f;
+    short i = 0, neg = 0;
+    if (v[0] == '-') { neg = 1; i = 1; }
+    for (; v[i] >= '0' && v[i] <= '9'; i++)
+        whole = whole * 10 + (v[i] - '0');
+    if (v[i] == '.')
+        for (i++; v[i] >= '0' && v[i] <= '9'; i++)
+            if (div < 10000) { frac = frac * 10 + (v[i] - '0'); div *= 10; }
+    num = whole * 10000 + frac * (10000 / div);        /* value x 10000 */
+    if (v[i] == 'c' && v[i + 1] == 'm') f = 5670;      /* twips x 10 per unit */
+    else if (v[i] == 'm' && v[i + 1] == 'm') f = 567;
+    else if (v[i] == 'i' && v[i + 1] == 'n') f = 14400;
+    else if (v[i] == 'p' && v[i + 1] == 't') f = 200;
+    else if (v[i] == 'p' && v[i + 1] == 'c') f = 2400;
+    else if (v[i] == 'p' && v[i + 1] == 'x') f = 150;
+    else return 0;
+    num = num / 100 * f / 1000;
+    return neg ? -num : num;
+}
+
+static short OdfFind(OdfCtx *o, const char *name, char family)
+{
+    short i;
+    for (i = 0; i < o->n; i++)
+        if (o->s[i].family == family && Eq(o->s[i].name, name))
+            return i;
+    return -1;
+}
+
+static void CopyName(char *d, const char *s)
+{
+    short i;
+    for (i = 0; s[i] && i < 31; i++)
+        d[i] = s[i];
+    d[i] = 0;
+}
+
+/* Apply the style `name` and its ancestors, the root first, so the style
+   itself wins. para: also the paragraph's spacing, indents and heading look. */
+static void OdfApply(Parser *p, const char *name, char family, short para, short *face, short *sz)
+{
+    OdfCtx *o = p->odf;
+    short chain[8], n = 0, i, k;
+    const char *nm = name;
+    while (nm[0] && n < 8) {
+        k = OdfFind(o, nm, family);
+        if (k < 0)
+            break;
+        chain[n++] = k;
+        nm = o->s[k].parent;
+    }
+    for (i = (short)(n - 1); i >= 0; i--) {
+        OdfStyle *s = &o->s[chain[i]];
+        if (para) {
+            if (s->has & OH_BEFORE) p->before = s->before;
+            if (s->has & OH_AFTER)  p->after = s->after;
+            if (s->has & OH_LEFT)   p->left = s->left;
+            if (s->has & OH_FIRST)  p->first = s->first;
+            if (s->has & OH_ALIGN)  p->align = s->align;
+            if (s->marker)          p->marker = s->marker;
+        }
+        *face = (short)((*face & ~s->faceMask) | (s->faceVal & s->faceMask));
+        if (s->has & OH_SZ) {
+            short base = (short)(*sz > 0 ? *sz : p->defSz);
+            *sz = (short)(s->sz >= 0 ? s->sz : (long)base * -s->sz / 100);
+        }
+    }
+}
+
+static void OdfParaProps(Parser *p, OdfStyle *s)
+{
+    char v[32];
+    long n;
+    if (AttrVal(p->tag, "margin-top", v, sizeof(v))) {
+        n = OdfLen(v);
+        if (s) { s->before = n; s->has |= OH_BEFORE; } else p->defBefore = n;
+    }
+    if (AttrVal(p->tag, "margin-bottom", v, sizeof(v))) {
+        n = OdfLen(v);
+        if (s) { s->after = n; s->has |= OH_AFTER; } else p->defAfter = n;
+    }
+    if (!s)
+        return;
+    if (AttrVal(p->tag, "margin-left", v, sizeof(v)) || AttrVal(p->tag, "margin-start", v, sizeof(v))) {
+        s->left = OdfLen(v);
+        s->has |= OH_LEFT;
+    }
+    if (AttrVal(p->tag, "text-indent", v, sizeof(v))) {
+        s->first = OdfLen(v);
+        s->has |= OH_FIRST;
+    }
+    if (AttrVal(p->tag, "text-align", v, sizeof(v))) {
+        s->align = (short)(Eq(v, "center") ? DOCX_AL_CENTER :
+                           (Eq(v, "end") || Eq(v, "right")) ? DOCX_AL_RIGHT :
+                           Eq(v, "justify") ? DOCX_AL_JUSTIFY : DOCX_AL_LEFT);
+        s->has |= OH_ALIGN;
+    }
+}
+
+static void OdfTextProps(Parser *p, OdfStyle *s)
+{
+    char v[32];
+    short i, pct;
+    if (AttrVal(p->tag, "font-size", v, sizeof(v))) {
+        for (i = 0; v[i] && v[i] != '%'; i++)
+            ;
+        if (v[i] == '%') {
+            for (pct = 0, i = 0; v[i] >= '0' && v[i] <= '9'; i++)
+                pct = (short)(pct * 10 + (v[i] - '0'));
+            if (s && pct > 0) { s->sz = (short)-pct; s->has |= OH_SZ; }
+        } else {
+            long hp = OdfLen(v) / 10;                    /* twips -> half-points */
+            if (hp > 0 && hp < 2000) {
+                if (s) { s->sz = (short)hp; s->has |= OH_SZ; } else p->defSz = (short)hp;
+            }
+        }
+    }
+    if (!s)
+        return;
+    if (AttrVal(p->tag, "font-weight", v, sizeof(v))) {
+        s->faceMask |= 1;
+        if (Eq(v, "bold") || (v[0] >= '6' && v[0] <= '9' && v[1] == '0' && v[2] == '0'))
+            s->faceVal |= 1;
+        else
+            s->faceVal &= ~1;
+    }
+    if (AttrVal(p->tag, "font-style", v, sizeof(v))) {
+        s->faceMask |= 2;
+        if (Eq(v, "italic") || Eq(v, "oblique"))
+            s->faceVal |= 2;
+        else
+            s->faceVal &= ~2;
+    }
+    if (AttrVal(p->tag, "text-underline-style", v, sizeof(v))) {
+        s->faceMask |= 4;
+        if (!Eq(v, "none"))
+            s->faceVal |= 4;
+        else
+            s->faceVal &= ~4;
+    }
+}
+
+static void OdfStartPara(Parser *p, short heading)
+{
+    OdfCtx *o = p->odf;
+    char v[48];
+    short face = 0, sz = 0;
+    p->inPara = 1;
+    p->paraStarted = 0;
+    p->marker = 0;
+    p->isList = 0;
+    p->listLevel = 0;
+    p->before = p->defBefore;
+    p->after = p->defAfter;
+    p->left = p->first = 0;
+    p->align = DOCX_AL_LEFT;
+    p->hasInd = 0;
+    p->numId = -1;
+    p->paraRec = 0;
+    p->inT = 1;
+    o->space = 1;                       /* leading white space goes */
+    o->spanDepth = 0;
+    if (AttrVal(p->tag, "style-name", v, sizeof(v)))
+        OdfApply(p, v, 'p', 1, &face, &sz);
+    if (heading) {
+        long lv = AttrNum(p->tag, "outline-level", 1);
+        p->marker = (wr_u8)(lv <= 1 ? DOCX_MK_H1 : lv == 2 ? DOCX_MK_H2 : DOCX_MK_H3);
+    }
+    if (o->listDepth > 0) {
+        p->hasInd = 1;
+        p->left = 360L * o->listDepth;  /* LibreOffice's default: 0.635 cm a level */
+        p->first = 0;
+        if (o->itemFresh) {
+            p->isList = 1;
+            p->listLevel = (short)(o->listDepth - 1);
+            p->first = -360;
+            o->itemFresh = 0;
+        }
+    }
+    p->runFace = face;
+    p->runSz = sz;
+}
+
+static void OdfSkip(Parser *p, short closing, short selfClose)
+{
+    if (closing)
+        p->skipDepth--;
+    else if (!selfClose)
+        p->skipDepth++;
+}
+
+static void OdfTag(Parser *p, const char *name, short closing, short selfClose)
+{
+    OdfCtx *o = p->odf;
+    char v[48], par[48];
+    short k;
+
+    /* not shown: notes, comments, deleted text; frames show as [Picture] */
+    if (Eq(name, "note-body") || Eq(name, "annotation") || Eq(name, "tracked-changes")) {
+        OdfSkip(p, closing, selfClose);
+        return;
+    }
+    if (Eq(name, "frame")) {
+        OdfSkip(p, closing, selfClose);
+        if (!closing && !selfClose)
+            o->frameLevel = p->skipDepth;
+        return;
+    }
+    if (Eq(name, "image")) {
+        if (!closing && p->skipDepth == o->frameLevel && p->skipDepth > 0 && p->inT) {
+            p->st->pictures++;
+            p->skipDepth = 0;            /* briefly: StartContent writes */
+            StartContent(p);
+            EmitStr(p, "[Picture]");
+            p->skipDepth = o->frameLevel;
+            o->frameLevel = -1;          /* one marker per frame */
+        }
+        return;
+    }
+    if (p->skipDepth > 0)
+        return;
+
+    /* styles (styles.xml, then content.xml's automatic styles) */
+    if (Eq(name, "style")) {
+        if (closing || selfClose) {
+            o->cur = -1;
+            if (!selfClose)
+                return;
+        }
+        if (closing)
+            return;
+        AttrVal(p->tag, "name", v, sizeof(v));
+        AttrVal(p->tag, "family", par, sizeof(par));
+        {
+            char fam = (char)(Eq(par, "paragraph") ? 'p' : Eq(par, "text") ? 't' : 0);
+            if (fam == 0)
+                return;
+            k = OdfFind(o, v, fam);       /* content.xml's P1 replaces styles.xml's */
+            if (k < 0) {
+                if (o->n >= ODF_MAXSTYLES)
+                    return;
+                k = o->n++;
+            }
+            {
+                OdfStyle *s = &o->s[k];
+                short i;
+                for (i = 0; i < (short)sizeof(OdfStyle); i++)
+                    ((char *)s)[i] = 0;
+                CopyName(s->name, v);
+                s->family = fam;
+                if (AttrVal(p->tag, "parent-style-name", par, sizeof(par)))
+                    CopyName(s->parent, par);
+                if (fam == 'p')
+                    s->marker = StyleMarker(v);
+            }
+            if (!selfClose)
+                o->cur = k;
+        }
+        return;
+    }
+    if (Eq(name, "default-style")) {
+        if (closing || selfClose)
+            o->cur = -1;
+        else {
+            AttrVal(p->tag, "family", par, sizeof(par));
+            o->cur = (short)(Eq(par, "paragraph") ? -2 : -1);
+        }
+        return;
+    }
+    if (Eq(name, "paragraph-properties")) {
+        if (!closing && o->cur != -1)
+            OdfParaProps(p, o->cur >= 0 ? &o->s[o->cur] : 0);
+        return;
+    }
+    if (Eq(name, "text-properties")) {
+        if (!closing && o->cur != -1)
+            OdfTextProps(p, o->cur >= 0 ? &o->s[o->cur] : 0);
+        return;
+    }
+
+    /* the body */
+    if (Eq(name, "list")) {
+        if (closing) { if (o->listDepth > 0) o->listDepth--; }
+        else if (!selfClose) o->listDepth++;
+        return;
+    }
+    if (Eq(name, "list-item") || Eq(name, "list-header")) {
+        if (!closing)
+            o->itemFresh = (short)Eq(name, "list-item");
+        return;
+    }
+    if (Eq(name, "p") || Eq(name, "h")) {
+        if (closing) {
+            EndParagraph(p);
+            p->inT = 0;
+            return;
+        }
+        OdfStartPara(p, (short)(name[0] == 'h'));
+        if (selfClose) {
+            EndParagraph(p);
+            p->inT = 0;
+        }
+        return;
+    }
+    if (Eq(name, "span") || Eq(name, "a")) {
+        if (closing) {
+            if (o->spanDepth > 0) {
+                o->spanDepth--;
+                if (o->spanDepth < 8) {
+                    p->runFace = o->stackFace[o->spanDepth];
+                    p->runSz = o->stackSz[o->spanDepth];
+                }
+            }
+        } else if (!selfClose) {
+            if (o->spanDepth < 8) {
+                o->stackFace[o->spanDepth] = p->runFace;
+                o->stackSz[o->spanDepth] = p->runSz;
+            }
+            o->spanDepth++;
+            if (AttrVal(p->tag, "style-name", v, sizeof(v)))
+                OdfApply(p, v, 't', 0, &p->runFace, &p->runSz);
+        }
+        return;
+    }
+    if (!p->inT || closing)
+        ;
+    else if (Eq(name, "tab")) {
+        StartContent(p);
+        Emit(p, '\t');
+        o->space = 0;
+        return;
+    } else if (Eq(name, "line-break")) {
+        StartContent(p);
+        Emit(p, (wr_u8)(p->tblDepth > 0 ? ' ' : DOCX_CH_LINEBREAK));
+        o->space = 1;
+        return;
+    } else if (Eq(name, "s")) {
+        long c = AttrNum(p->tag, "c", 1);
+        StartContent(p);
+        while (c-- > 0 && c < 200)
+            Emit(p, ' ');
+        o->space = 1;
+        return;
+    }
+    if (Eq(name, "table")) {
+        if (closing) { if (p->tblDepth > 0) p->tblDepth--; }
+        else if (!selfClose) {
+            p->tblDepth++;
+            p->st->tables++;
+            p->pendTab = 0;
+            p->cellSep = 0;
+        }
+    } else if (Eq(name, "table-row")) {
+        p->pendTab = 0;
+        p->cellSep = 0;
+        if (closing)
+            EmitCR(p);
+    } else if (Eq(name, "table-cell") || Eq(name, "covered-table-cell")) {
+        if (closing || selfClose) {
+            p->pendTab = 1;
+            p->cellSep = 0;
+        }
+    }
 }
 
 static void HandleTag(Parser *p)
@@ -311,6 +987,10 @@ static void HandleTag(Parser *p)
         return;
     selfClose = (short)(p->tag[p->tagLen - 1] == '/');
     closing = TagName(p->tag, name, sizeof(name));
+    if (p->odf) {
+        OdfTag(p, name, closing, selfClose);
+        return;
+    }
 
     if (Eq(name, "Fallback")) {
         if (closing)
@@ -322,6 +1002,8 @@ static void HandleTag(Parser *p)
     if (p->skipDepth > 0)
         return;
 
+    if (closing && HandleFormat(p, name, closing, selfClose))
+        return;
     if (Eq(name, "p")) {
         if (closing) {
             EndParagraph(p);
@@ -331,6 +1013,14 @@ static void HandleTag(Parser *p)
             p->marker = 0;
             p->isList = 0;
             p->listLevel = 0;
+            p->before = p->defBefore;
+            p->after = p->defAfter;
+            p->left = p->first = 0;
+            p->align = DOCX_AL_LEFT;
+            p->hasInd = 0;
+            p->numId = -1;
+            p->paraRec = 0;
+            p->inPPr = p->inRPr = 0;
             if (selfClose)
                 EndParagraph(p);
         }
@@ -339,8 +1029,12 @@ static void HandleTag(Parser *p)
     } else if (Eq(name, "r")) {
         if (closing)
             p->runDepth--;
-        else if (!selfClose)
+        else if (!selfClose) {
             p->runDepth++;
+            p->runFace = 0;
+            p->runSz = 0;
+            p->inRPr = 0;
+        }
     } else if (closing) {
         if (Eq(name, "tc")) {
             p->pendTab = 1;
@@ -348,7 +1042,7 @@ static void HandleTag(Parser *p)
         } else if (Eq(name, "tr")) {
             p->pendTab = 0;
             p->cellSep = 0;
-            Emit(p, '\r');
+            EmitCR(p);
         } else if (Eq(name, "tbl")) {
             if (p->tblDepth > 0)
                 p->tblDepth--;
@@ -358,6 +1052,8 @@ static void HandleTag(Parser *p)
             p->marker = StyleMarker(val);
             ListStyle(p, val);
         }
+    } else if (HandleFormat(p, name, closing, selfClose)) {
+        ;
     } else if (Eq(name, "numPr")) {
         p->isList = 1;
     } else if (Eq(name, "ilvl")) {
@@ -371,7 +1067,7 @@ static void HandleTag(Parser *p)
     } else if (Eq(name, "br") || Eq(name, "cr")) {
         if (p->runDepth > 0) {
             StartContent(p);
-            Emit(p, (wr_u8)(p->tblDepth > 0 ? ' ' : '\r'));
+            Emit(p, (wr_u8)(p->tblDepth > 0 ? ' ' : DOCX_CH_LINEBREAK));
         }
     } else if (Eq(name, "noBreakHyphen")) {
         StartContent(p);
@@ -597,6 +1293,8 @@ static void InitParser(Parser *p, WrWriteFn wr, void *wctx, DocxStats *st)
     p->wctx = wctx;
     p->st = st;
     p->mode = M_TEXT;
+    p->defSz = 22;                  /* 11 pt, Word's default */
+    p->curAbs = p->curLvl = p->curNum = -1;
 }
 
 static short Finish(Parser *p, short err)
@@ -604,6 +1302,41 @@ static short Finish(Parser *p, short err)
     Flush(p, 0);
     if (err == ZIP_ERR_STOPPED || p->stopped)
         return ZIP_ERR_STOPPED;
+    return err;
+}
+
+/* OpenDocument text: styles.xml (named styles, defaults), then content.xml
+   (its automatic styles, then the body), through the same parser. */
+static short ReadOdf(WrSource *src, Parser *p, DocxStats *st)
+{
+    ZipEntry e;
+    short err, i;
+    const char *part = "content.xml";
+    st->format = DOCX_FMT_ODT;
+    for (i = 0; part[i]; i++)
+        st->part[i] = part[i];
+    st->part[i] = 0;
+    p->odf = (OdfCtx *)WR_ALLOC(sizeof(OdfCtx));
+    if (p->odf == 0)
+        return ZIP_ERR_MEM;
+    p->odf->cur = p->odf->frameLevel = -1;
+    p->defSz = 24;                      /* 12 pt, LibreOffice's default */
+    if (zip_find(src, "styles.xml", &e) == ZIP_OK) {
+        zip_extract(src, &e, XmlFeed, p);
+        p->mode = M_TEXT;
+        p->inT = 0;
+        p->skipDepth = 0;
+        p->odf->cur = -1;
+    }
+    st->xmlBytes = 0;
+    err = zip_find(src, part, &e);
+    if (err == ZIP_OK)
+        err = zip_extract(src, &e, XmlFeed, p);
+    else
+        err = DOCX_ERR_FORMAT;
+    err = Finish(p, err);
+    WR_FREE(p->odf);
+    p->odf = 0;
     return err;
 }
 
@@ -640,6 +1373,22 @@ short docx_convert(WrSource *src, WrWriteFn wr, void *wctx, DocxStats *st)
             WR_FREE(p);
             return ZIP_ERR_MEM;
         }
+        /* OpenDocument: the first member, "mimetype", says what it is */
+        if (zip_find(src, "mimetype", &e) == ZIP_OK && e.size < 200 &&
+            zip_extract(src, &e, MemWrite, rels) == ZIP_OK &&
+            Contains(rels->buf, "opendocument")) {
+            short text = Contains(rels->buf, "opendocument.text");
+            WR_FREE(rels);
+            if (!text) {                     /* .ods, .odp, ... */
+                WR_FREE(p);
+                return DOCX_ERR_NOTWORD;
+            }
+            err = ReadOdf(src, p, st);
+            WR_FREE(p);
+            return err;
+        }
+        rels->len = 0;
+        rels->buf[0] = 0;
         if (zip_find(src, "_rels/.rels", &e) == ZIP_OK &&
             zip_extract(src, &e, MemWrite, rels) == ZIP_OK)
             MainPartFromRels(rels->buf, st->part, sizeof(st->part));
@@ -663,8 +1412,21 @@ short docx_convert(WrSource *src, WrWriteFn wr, void *wctx, DocxStats *st)
         } else {
             err = zip_find(src, st->part, &e);
         }
-        if (err == ZIP_OK)
+        if (err == ZIP_OK) {
+            /* defaults and list indents first: same parser, no text in them */
+            ZipEntry aux;
+            static const char *kAux[2] = { "word/styles.xml", "word/numbering.xml" };
+            short k;
+            for (k = 0; k < 2 && !p->stopped; k++)
+                if (zip_find(src, kAux[k], &aux) == ZIP_OK) {
+                    zip_extract(src, &aux, XmlFeed, p);
+                    p->mode = M_TEXT;
+                    p->inT = 0;
+                    p->inDocDef = p->inDefStyle = p->inPPr = p->inRPr = 0;
+                }
+            st->xmlBytes = 0;
             err = zip_extract(src, &e, XmlFeed, p);
+        }
         err = Finish(p, err);
         WR_FREE(p);
         return err;
@@ -681,6 +1443,23 @@ short docx_convert(WrSource *src, WrWriteFn wr, void *wctx, DocxStats *st)
         wr_u32 off = (wr_u32)i;
         st->format = DOCX_FMT_FLATXML;
         err = DOCX_OK;
+        {   /* flat OpenDocument (.fodt)? its namespace shows up early */
+            n = src->readAt(src->ctx, off, buf, (long)(src->size - off < sizeof(buf) - 1 ? src->size - off : sizeof(buf) - 1));
+            if (n > 0) {
+                buf[n] = 0;
+                for (i = 0; i < n; i++)
+                    if (buf[i] == 0) buf[i] = ' ';
+                if (Contains((char *)buf, "urn:oasis:names:tc:opendocument")) {
+                    p->odf = (OdfCtx *)WR_ALLOC(sizeof(OdfCtx));
+                    if (p->odf == 0) {
+                        WR_FREE(p);
+                        return ZIP_ERR_MEM;
+                    }
+                    p->odf->cur = p->odf->frameLevel = -1;
+                    st->format = DOCX_FMT_FLATODT;
+                }
+            }
+        }
         while (off < src->size && err == DOCX_OK && !p->stopped) {
             long want = (long)(src->size - off);
             if (want > (long)sizeof(buf))
@@ -696,10 +1475,22 @@ short docx_convert(WrSource *src, WrWriteFn wr, void *wctx, DocxStats *st)
         if (err == DOCX_OK && st->paragraphs == 0)
             err = DOCX_ERR_FORMAT;     /* XML, but no WordprocessingML in it */
         err = Finish(p, err);
+        if (p->odf)
+            WR_FREE(p->odf);
         WR_FREE(p);
         return err;
     }
 
     WR_FREE(p);
     return DOCX_ERR_FORMAT;
+}
+
+long docx_ctrl_len(const wr_u8 *t, long i, long len)
+{
+    wr_u8 c = t[i];
+    if (DOCX_IS_MARKER(c) || DOCX_IS_FACE(c) || DOCX_IS_SIZE(c))
+        return 1;
+    if (c == DOCX_PARA)
+        return (i + DOCX_PARA_LEN <= len) ? DOCX_PARA_LEN : len - i;
+    return 0;
 }

@@ -27,10 +27,34 @@
    itself. Anything that leaves the program spells it "EUR". */
 #define DOCX_CH_EURO  0x05
 
+/* Formatting, carried in the text as control bytes (never CR, never >= 0x20
+   on their own), the same for every input format:
+
+   DOCX_PARA + 5 bytes   at a paragraph's start, each byte 0x20 + value:
+                         space before, space after (points), left indent,
+                         first-line indent + 100 (both in 2-point units;
+                         negative = hanging), alignment (DOCX_AL_*)
+   0x10 + face           run face from here on: bold 1, italic 2, underline 4
+   0x18 + step + 2       run size from here on, in steps relative to body
+                         text (-2 .. +5); the viewer maps steps to real sizes
+   DOCX_CH_LINEBREAK     a line break inside a paragraph (keeps its indent)
+
+   Run face and size start at plain body text after every CR. */
+#define DOCX_PARA         0x06
+#define DOCX_PARA_LEN     6
+#define DOCX_FACE0        0x10
+#define DOCX_SIZE0        0x18
+#define DOCX_CH_LINEBREAK 0x0B
+#define DOCX_IS_FACE(c)   ((c) >= 0x10 && (c) <= 0x17)
+#define DOCX_IS_SIZE(c)   ((c) >= 0x18 && (c) <= 0x1F)
+enum { DOCX_AL_LEFT = 0, DOCX_AL_CENTER, DOCX_AL_RIGHT, DOCX_AL_JUSTIFY };
+
 enum {
     DOCX_FMT_UNKNOWN = 0,
     DOCX_FMT_OOXML,        /* .docx family, zipped */
-    DOCX_FMT_FLATXML       /* Word 2003 XML / Flat OPC */
+    DOCX_FMT_FLATXML,      /* Word 2003 XML / Flat OPC */
+    DOCX_FMT_ODT,          /* OpenDocument text (.odt/.ott), zipped */
+    DOCX_FMT_FLATODT       /* OpenDocument flat XML (.fodt) */
 };
 
 typedef struct {
@@ -55,6 +79,9 @@ enum {
     DOCX_ERR_UTF16 = 24
     /* plus the ZIP_ERR_* codes from zipdir.h */
 };
+
+/* Length of the control item starting at t[i] (0: text). */
+long docx_ctrl_len(const wr_u8 *t, long i, long len);
 
 short docx_convert(WrSource *src, WrWriteFn wr, void *wctx, DocxStats *st);
 

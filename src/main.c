@@ -78,13 +78,22 @@ QDGlobals qd;
 #define rAlertAbout   129
 #define rAlertInfo    130
 
-enum { kStyleBody = 0, kStyleTitle, kStyleH1, kStyleH2, kStyleH3, kStyleCount };
+/* run face and size: QuickDraw face bits, size step from body text */
+typedef struct {
+    unsigned char face;
+    signed char   step;
+} RunState;
 
 typedef struct {
     long          start;     /* offset of the first byte in the text */
     short         len;       /* bytes on this line, without the CR */
-    unsigned char style;
-    unsigned char paraEnd;   /* last line of a paragraph: a little air below */
+    unsigned char face;      /* run state where the line starts */
+    signed char   step;
+    short         x0;        /* indent of the first character */
+    short         left;      /* the paragraph's left indent (hanging tab stop) */
+    short         shift;     /* centring / right alignment */
+    short         asc;       /* line top to baseline, space before included */
+    short         height;    /* whole line, space before and after included */
 } LineRec;
 
 typedef struct {
@@ -105,13 +114,13 @@ typedef struct {
     Boolean       active;    /* front and not suspended: show the selection */
 } DocRec, *DocPtr;
 
-/* per-style metrics for the current text size */
+/* metrics of one face and size of Geneva */
 typedef struct {
-    short font, size, face;
+    short size, face;
     short ascent, height;
     short widths[256];
     unsigned char missing[256];   /* the font has no glyph: draw a stand-in */
-} StyleMetrics;
+} Metrics;
 
 /* Stand-ins for MacRoman characters a bitmap font may lack. Geneva and
    friends predate some of MacRoman's later additions (‚ „ ‰ ﬁ ﬂ ¤ ...):
@@ -126,6 +135,7 @@ static const char *GlyphStandIn(unsigned char c)
     case 0xDF: return "fl";
     case 0xDA: return "/";       /* ⁄ fraction slash */
     case 0xDB: return "*";       /* ¤ currency */
+    case 0xE1: return ".";       /* · middle dot: the width; DrawLine draws a real dot */
     case 0xDC: return "<";       /* ‹ */
     case 0xDD: return ">";       /* › */
     case 0xD7: return "<>";      /* ◊ */
@@ -179,7 +189,6 @@ static void DrawEuro(short width, short ascent, Boolean bold)
     MoveTo((short)(x + width), base);
 }
 
-static StyleMetrics gMetrics[kStyleCount];
 static short gBaseSize = 12;
 static short gQuit = 0;
 static long  gLastYield = 0;
@@ -262,14 +271,14 @@ static void ErrorText(short err, Str255 msg)
         CCat(msg, "This is an RTF file, not a .docx. Open it with a word processor.");
         break;
     case DOCX_ERR_NOTWORD:
-        CCat(msg, "This is an Office document, but not a Word one (Excel or PowerPoint?).");
+        CCat(msg, "This is an office document, but not a text one (a spreadsheet or a presentation?).");
         break;
     case DOCX_ERR_UTF16:
         CCat(msg, "This XML file is UTF-16 encoded; only UTF-8 Word XML is supported.");
         break;
     case DOCX_ERR_FORMAT:
     case ZIP_ERR_NOTZIP:
-        CCat(msg, "This is not a Word document (.docx, .docm, .dotx, Word XML).");
+        CCat(msg, "This is not a document WordReader knows (.docx, .docm, .dotx, Word XML, .odt, .fodt).");
         break;
     case ZIP_ERR_NOENTRY:
         CCat(msg, "The package has no main document part. Is it damaged?");
@@ -310,44 +319,24 @@ static void Breathe(void)
 
 /* --------------------------------------------------------------- metrics */
 
-static void SetStyle(short style)
+/* Metrics for one face and size, made when first needed. Sizes snap to
+   Geneva's bitmap sizes so every run stays crisp on the Duo's LCD. */
+#define kLadderN 7
+static const short kLadder[kLadderN] = { 9, 10, 12, 14, 18, 20, 24 };
+static Metrics *gM[8][kLadderN];
+static short gBodyIdx = 2;            /* kLadder[gBodyIdx] == gBaseSize */
+
+static short SizeIdx(short step)
 {
-    TextFont(gMetrics[style].font);
-    TextSize(gMetrics[style].size);
-    TextFace(gMetrics[style].face);
+    short i = (short)(gBodyIdx + step);
+    return (short)(i < 0 ? 0 : i >= kLadderN ? kLadderN - 1 : i);
 }
 
-static void FindMissingGlyphs(void);
-
-static void ComputeMetrics(void)
+static void UseFont(const Metrics *m)
 {
-    short s, c;
-    FontInfo fi;
-    GrafPtr save;
-    GetPort(&save);
-    SetPort((GrafPtr)FrontWindow() ? FrontWindow() : save);
-    for (s = 0; s < kStyleCount; s++) {
-        StyleMetrics *m = &gMetrics[s];
-        m->font = applFont;                 /* Geneva: crisp on the Duo's LCD */
-        m->face = (s == kStyleBody) ? 0 : bold;
-        m->size = gBaseSize;
-        if (s == kStyleTitle) m->size = (short)(gBaseSize + 8);
-        if (s == kStyleH1)    m->size = (short)(gBaseSize + 6);
-        if (s == kStyleH2)    m->size = (short)(gBaseSize + 2);
-        SetStyle(s);
-        GetFontInfo(&fi);
-        m->ascent = fi.ascent;
-        m->height = (short)(fi.ascent + fi.descent + fi.leading);
-        if (s != kStyleBody)
-            m->height += gBaseSize / 2;     /* air above a heading */
-        for (c = 0; c < 256; c++)
-            m->widths[c] = CharWidth((char)c);
-        m->widths['\t'] = 0;
-        m->widths['\r'] = 0;
-    }
-    SetStyle(kStyleBody);
-    SetPort(save);
-    FindMissingGlyphs();
+    TextFont(applFont);               /* Geneva */
+    TextFace((Style)m->face);
+    TextSize(m->size);
 }
 
 /* Which MacRoman characters does the font in use actually have? FMSwapFont
@@ -355,53 +344,84 @@ static void ComputeMetrics(void)
    ('FONT'/'NFNT') the offset/width table holds -1 for every absent glyph
    (Inside Macintosh: Text 4-71). A TrueType font answers with an 'sfnt'
    instead - left alone, it has the whole MacRoman set. */
-static void FindMissingGlyphs(void)
+static void FindMissingGlyphs(Metrics *m)
 {
-    short s, c;
-    for (s = 0; s < kStyleCount; s++) {
-        StyleMetrics *m = &gMetrics[s];
-        FMInput in;
-        FMOutPtr out;
-        FontRec *fr;
-        short *owt;
-        long off;
+    FMInput in;
+    FMOutPtr out;
+    FontRec *fr;
+    short *owt, c;
+    long off;
 
-        for (c = 0; c < 256; c++)
-            m->missing[c] = 0;
-        in.family = m->font;
-        in.size = m->size;
-        in.face = (Style)m->face;
-        in.needBits = true;
-        in.device = 0;
-        in.numer.h = in.numer.v = 1;
-        in.denom.h = in.denom.v = 1;
-        out = FMSwapFont(&in);
-        if (out == 0 || out->fontHandle == 0 || *out->fontHandle == 0)
-            continue;
-        fr = (FontRec *)*out->fontHandle;
-        if ((fr->fontType & 0x9000) != 0x9000)      /* not a bitmap strike */
-            continue;
-        off = (unsigned short)fr->owTLoc;
-        if (fr->nDescent > 0)                       /* high word of a big offset */
-            off |= (long)fr->nDescent << 16;
-        owt = (short *)((char *)&fr->owTLoc + off * 2);
-        for (c = 0x80; c < 256; c++) {
-            if (c < fr->firstChar || c > fr->lastChar || owt[c - fr->firstChar] == -1) {
-                const char *sub = GlyphStandIn((unsigned char)c);
-                short n = 0;
-                while (sub[n])
-                    n++;
-                m->missing[c] = 1;
-                SetStyle(s);
-                m->widths[c] = TextWidth((Ptr)sub, 0, n);
-            }
+    in.family = applFont;
+    in.size = m->size;
+    in.face = (Style)m->face;
+    in.needBits = true;
+    in.device = 0;
+    in.numer.h = in.numer.v = 1;
+    in.denom.h = in.denom.v = 1;
+    out = FMSwapFont(&in);
+    if (out == 0 || out->fontHandle == 0 || *out->fontHandle == 0)
+        return;
+    fr = (FontRec *)*out->fontHandle;
+    if ((fr->fontType & 0x9000) != 0x9000)      /* not a bitmap strike */
+        return;
+    off = (unsigned short)fr->owTLoc;
+    if (fr->nDescent > 0)                       /* high word of a big offset */
+        off |= (long)fr->nDescent << 16;
+    owt = (short *)((char *)&fr->owTLoc + off * 2);
+    for (c = 0x80; c < 256; c++) {
+        if (c < fr->firstChar || c > fr->lastChar || owt[c - fr->firstChar] == -1) {
+            const char *sub = GlyphStandIn((unsigned char)c);
+            short n = 0;
+            while (sub[n])
+                n++;
+            m->missing[c] = 1;
+            m->widths[c] = TextWidth((Ptr)sub, 0, n);
         }
     }
-    for (s = 0; s < kStyleCount; s++) {
-        gMetrics[s].missing[DOCX_CH_EURO] = 1;
-        gMetrics[s].widths[DOCX_CH_EURO] = gMetrics[s].widths['0'];
+}
+
+static Metrics *GetM(short face, short idx)
+{
+    Metrics *m;
+    FontInfo fi;
+    short c, f, i;
+
+    face &= 7;
+    m = gM[face][idx];
+    if (m)
+        return m;
+    m = (Metrics *)NewPtrClear(sizeof(Metrics));
+    if (m == 0) {                               /* out of memory: anything we have */
+        for (f = 0; f < 8; f++)
+            for (i = 0; i < kLadderN; i++)
+                if (gM[f][i])
+                    return gM[f][i];
+        return 0;                               /* not reached: body made at start */
     }
-    SetStyle(kStyleBody);
+    m->size = kLadder[idx];
+    m->face = face;
+    UseFont(m);
+    GetFontInfo(&fi);
+    m->ascent = fi.ascent;
+    m->height = (short)(fi.ascent + fi.descent + fi.leading);
+    for (c = 0; c < 256; c++)
+        m->widths[c] = (c < 0x20) ? 0 : CharWidth((char)c);
+    FindMissingGlyphs(m);
+    m->missing[DOCX_CH_EURO] = 1;               /* drawn by DrawEuro */
+    m->widths[DOCX_CH_EURO] = m->widths['0'];
+    gM[face][idx] = m;
+    return m;
+}
+
+static void SetBodySize(short size)
+{
+    short i;
+    gBaseSize = size;
+    for (i = 0; i < kLadderN; i++)
+        if (kLadder[i] == size)
+            gBodyIdx = i;
+    GetM(0, gBodyIdx);
 }
 
 /* ---------------------------------------------------------------- layout */
@@ -412,16 +432,98 @@ static void ContentRect(WindowPtr w, Rect *r)
     r->right -= kSBarWidth;
 }
 
-/* Height of one line on screen: the style's line height, plus some air after
-   a paragraph (Word's "space after"). */
-static short LineHeight(const LineRec *lr)
+/* Points in the document -> pixels, scaled with the chosen text size. */
+static short Px(short pt)
 {
-    return (short)(gMetrics[lr->style].height + (lr->paraEnd ? gBaseSize / 3 : 0));
+    return (short)((long)pt * gBaseSize / 12);
 }
 
-static Boolean AddLine(DocPtr d, long start, long len, short style)
+typedef struct {
+    short before, after, left, first, align;
+    unsigned char marker;
+} ParaInfo;
+
+/* Read a paragraph's prefix (style marker, DOCX_PARA record); returns the
+   offset of its first text byte. */
+static long ParsePara(const unsigned char *t, long p, long end, ParaInfo *pi)
 {
-    LineRec *lr;
+    Boolean rec = false;
+    pi->before = pi->after = pi->left = pi->first = pi->align = 0;
+    pi->marker = 0;
+    while (p < end) {
+        unsigned char c = t[p];
+        if (DOCX_IS_MARKER(c)) {
+            pi->marker = c;
+            p++;
+        } else if (c == DOCX_PARA && p + DOCX_PARA_LEN <= end) {
+            pi->before = Px((short)(t[p + 1] - 0x20));
+            pi->after = Px((short)(t[p + 2] - 0x20));
+            pi->left = Px((short)((t[p + 3] - 0x20) * 2));
+            pi->first = Px((short)((t[p + 4] - 0x20 - 100) * 2));
+            pi->align = (short)(t[p + 5] - 0x20);
+            p += DOCX_PARA_LEN;
+            rec = true;
+        } else
+            break;
+    }
+    if (!rec)
+        pi->after = (short)(gBaseSize / 3);     /* plain text: a little air */
+    if (pi->marker && pi->before < gBaseSize / 2)
+        pi->before = (short)(gBaseSize / 2);    /* headings: air above */
+    return p;
+}
+
+/* A heading's look comes from its style marker. */
+static void MarkerState(unsigned char mk, RunState *s)
+{
+    s->face = (unsigned char)(mk ? bold : 0);
+    s->step = (signed char)(mk == DOCX_MK_TITLE ? 3 : mk == DOCX_MK_H1 ? 2 : mk == DOCX_MK_H2 ? 1 : 0);
+}
+
+/* The next tab stop: the hanging indent first, then every half inch. */
+static short NextTab(short x, short left)
+{
+    if (x < left)
+        return left;
+    return (short)((x / kTabWidth + 1) * kTabWidth);
+}
+
+/* Walks a line byte by byte, following run face and size changes. */
+typedef struct {
+    RunState s;
+    Metrics *m;
+    short    x;          /* logical x: 0 = left margin, before alignment */
+} Walker;
+
+static void WalkStart(Walker *w, const LineRec *lr)
+{
+    w->s.face = lr->face;
+    w->s.step = lr->step;
+    w->m = GetM(w->s.face, SizeIdx(w->s.step));
+    w->x = lr->x0;
+}
+
+/* Advance over byte c; returns its width (0 for control bytes). */
+static short WalkStep(Walker *w, unsigned char c, short left)
+{
+    short cw;
+    if (DOCX_IS_FACE(c)) {
+        w->s.face = (unsigned char)(c - DOCX_FACE0);
+        w->m = GetM(w->s.face, SizeIdx(w->s.step));
+        return 0;
+    }
+    if (DOCX_IS_SIZE(c)) {
+        w->s.step = (signed char)(c - DOCX_SIZE0 - 2);
+        w->m = GetM(w->s.face, SizeIdx(w->s.step));
+        return 0;
+    }
+    cw = (c == '\t') ? (short)(NextTab(w->x, left) - w->x) : w->m->widths[c];
+    w->x += cw;
+    return cw;
+}
+
+static Boolean AddLine(DocPtr d, const LineRec *src)
+{
     if (d->nLines >= d->linesCap) {
         long ncap = d->linesCap ? d->linesCap * 2 : 1024;
         SetHandleSize(d->lines, ncap * (long)sizeof(LineRec));
@@ -429,27 +531,23 @@ static Boolean AddLine(DocPtr d, long start, long len, short style)
             return false;
         d->linesCap = ncap;
     }
-    lr = (LineRec *)*d->lines + d->nLines++;
-    lr->start = start;
-    lr->len = (short)len;
-    lr->style = (unsigned char)style;
-    lr->paraEnd = 0;
+    ((LineRec *)*d->lines)[d->nLines++] = *src;
     return true;
-}
-
-static short NextTab(short x)
-{
-    return (short)((x / kTabWidth + 1) * kTabWidth);
 }
 
 static void Layout(WindowPtr w)
 {
     DocPtr d = DocOf(w);
     Rect r;
-    short maxW, x, style, cw;
-    long i, p, end, lineStart, lastBreak;
+    short maxW, left, x0;
+    long i, p, end, lineStart, lineEnd, next, lastBreak, k;
     unsigned char *t;
     long h, avail;
+    ParaInfo pi;
+    RunState st;
+    LineRec lr;
+    Walker wk;
+    Boolean first, placed;
 
     if (d == 0)
         return;
@@ -466,36 +564,83 @@ static void Layout(WindowPtr w)
         end = p;
         while (end < d->len && t[end] != '\r')
             end++;
-        style = kStyleBody;
-        if (end > p && DOCX_IS_MARKER(t[p])) {
-            style = t[p];
-            p++;
-        }
+        p = ParsePara(t, p, end, &pi);
+        MarkerState(pi.marker, &st);
+        left = pi.left;
+        if (left > maxW / 2) left = (short)(maxW / 2);
+        x0 = (short)(pi.left + pi.first);
+        if (x0 < 0) x0 = 0;
+        if (x0 > maxW / 2) x0 = (short)(maxW / 2);
         lineStart = p;
-        lastBreak = -1;
-        x = 0;
-        for (i = p; i < end; i++) {
-            unsigned char c = t[i];
-            cw = (c == '\t') ? (short)(NextTab(x) - x) : gMetrics[style].widths[c];
-            if ((x + cw > maxW && i > lineStart) || i - lineStart > 2000) {
-                long brk = (lastBreak > lineStart) ? lastBreak : i;
-                long k;
-                if (!AddLine(d, lineStart, brk - lineStart, style))
-                    goto done;
-                lineStart = brk;
-                lastBreak = -1;
-                x = 0;
-                for (k = lineStart; k < i; k++)
-                    x += (t[k] == '\t') ? (short)(NextTab(x) - x) : gMetrics[style].widths[t[k]];
-                cw = (c == '\t') ? (short)(NextTab(x) - x) : gMetrics[style].widths[c];
+        first = true;
+        do {
+            /* where does this line end? */
+            wk.s = st;
+            wk.m = GetM(st.face, SizeIdx(st.step));
+            wk.x = x0;
+            lastBreak = -1;
+            placed = false;
+            for (i = lineStart; i < end && i - lineStart < 2000; i++) {
+                unsigned char c = t[i];
+                short cw;
+                if (c == DOCX_CH_LINEBREAK)
+                    break;
+                cw = WalkStep(&wk, c, left);
+                if (cw > 0 && wk.x > maxW && placed)
+                    break;
+                if (cw > 0)
+                    placed = true;
+                if (c == ' ' || c == '-' || c == '\t')
+                    lastBreak = i + 1;
             }
-            x += cw;
-            if (c == ' ' || c == '-' || c == '\t')
-                lastBreak = i + 1;
-        }
-        if (!AddLine(d, lineStart, end - lineStart, style))
-            goto done;
-        ((LineRec *)*d->lines)[d->nLines - 1].paraEnd = 1;
+            if (i < end && t[i] == DOCX_CH_LINEBREAK) {
+                lineEnd = i;
+                next = i + 1;
+            } else if (i >= end) {
+                lineEnd = next = end;
+            } else {
+                lineEnd = next = (lastBreak > lineStart) ? lastBreak : i;
+            }
+
+            /* measure it: tallest run, width without trailing blanks */
+            lr.start = lineStart;
+            lr.len = (short)(lineEnd - lineStart);
+            lr.face = st.face;
+            lr.step = st.step;
+            lr.x0 = x0;
+            lr.left = left;
+            lr.shift = 0;
+            WalkStart(&wk, &lr);
+            {
+                short asc = wk.m->ascent, desc = (short)(wk.m->height - wk.m->ascent);
+                short xEnd = x0, content;
+                for (k = lineStart; k < lineEnd; k++) {
+                    unsigned char c = t[k];
+                    if (WalkStep(&wk, c, left) > 0 || c == ' ') {
+                        if (wk.m->ascent > asc) asc = wk.m->ascent;
+                        if (wk.m->height - wk.m->ascent > desc)
+                            desc = (short)(wk.m->height - wk.m->ascent);
+                        if (c != ' ' && c != '\t')
+                            xEnd = wk.x;
+                    }
+                }
+                content = (short)(xEnd - x0);
+                if (pi.align == DOCX_AL_CENTER)
+                    lr.shift = (short)((maxW - x0 - content) / 2);
+                else if (pi.align == DOCX_AL_RIGHT)
+                    lr.shift = (short)(maxW - x0 - content);
+                if (lr.shift < 0)
+                    lr.shift = 0;
+                lr.asc = (short)((first ? pi.before : 0) + asc);
+                lr.height = (short)(lr.asc + desc + (next >= end ? pi.after : 0));
+            }
+            if (!AddLine(d, &lr))
+                goto done;
+            st = wk.s;
+            lineStart = next;
+            x0 = left;
+            first = false;
+        } while (lineStart < end);
         p = end + 1;
     }
 done:
@@ -505,7 +650,7 @@ done:
     avail = r.bottom - r.top - kMargin;
     h = 0;
     for (i = d->nLines - 1; i >= 0; i--) {
-        h += LineHeight((LineRec *)*d->lines + i);
+        h += ((LineRec *)*d->lines)[i].height;
         if (h > avail)
             break;
     }
@@ -521,81 +666,99 @@ done:
 
 /* --------------------------------------------------------------- drawing */
 
-/* x of text offset pos on line lr, from the text's left edge */
+/* logical x of text offset pos on line lr */
 static short LineX(const unsigned char *t, const LineRec *lr, long pos)
 {
-    const StyleMetrics *m = &gMetrics[lr->style];
-    short x = 0;
+    Walker wk;
     long k;
+    WalkStart(&wk, lr);
     for (k = lr->start; k < pos && k < lr->start + lr->len; k++)
-        x += (t[k] == '\t') ? (short)(NextTab(x) - x) : m->widths[t[k]];
-    return x;
+        WalkStep(&wk, t[k], lr->left);
+    return wk.x;
 }
 
-/* text offset nearest to x on line lr */
+/* text offset nearest to logical x hx on line lr */
 static long LinePos(const unsigned char *t, const LineRec *lr, short hx)
 {
-    const StyleMetrics *m = &gMetrics[lr->style];
-    short x = 0, cw;
+    Walker wk;
     long k;
+    WalkStart(&wk, lr);
     for (k = lr->start; k < lr->start + lr->len; k++) {
-        cw = (t[k] == '\t') ? (short)(NextTab(x) - x) : m->widths[t[k]];
-        if (hx < x + cw / 2)
+        short x = wk.x, cw = WalkStep(&wk, t[k], lr->left);
+        if (cw > 0 && hx < x + cw / 2)
             return k;
-        x += cw;
     }
     return lr->start + lr->len;
 }
 
-/* Draw line i whose bottom is at y; erase first if asked. The selection is
+/* Draw line i whose top is at top; erase first if asked. The selection is
    inverted in the highlight colour; it runs to the right edge when it
    continues onto the next line, as in TextEdit. */
-static void DrawLine(WindowPtr w, DocPtr d, const unsigned char *t, long i, short y,
+static void DrawLine(DocPtr d, const unsigned char *t, long i, short top,
                      const Rect *r, Boolean erase)
 {
-#pragma unused(w)
     LineRec *lr = (LineRec *)*d->lines + i;
-    StyleMetrics *m = &gMetrics[lr->style];
-    short segStart = 0, k, top = (short)(y - LineHeight(lr));
-    long a = lr->start, b = lr->start + lr->len;
-    long next = (i + 1 < d->nLines) ? ((LineRec *)*d->lines)[i + 1].start : d->len + 1;
+    long a = lr->start, b = lr->start + lr->len, k, seg = a;
+    long next = (i + 1 < d->nLines) ? lr[1].start : d->len + 1;
+    short org = (short)(r->left + kMargin + lr->shift);
+    short base = (short)(top + lr->asc);
+    Walker wk;
     Rect lineR;
 
-    SetRect(&lineR, r->left, top, r->right, y);
+    SetRect(&lineR, r->left, top, r->right, (short)(top + lr->height));
     if (erase)
         EraseRect(&lineR);
-    SetStyle(lr->style);
-    /* baseline: the line's top, the air above a heading, then the ascent */
-    MoveTo((short)(r->left + kMargin),
-           (short)(top + m->ascent + (lr->style != kStyleBody ? gBaseSize / 2 : 0)));
-    for (k = 0; k <= lr->len; k++) {
-        unsigned char c = (k < lr->len) ? t[lr->start + k] : 0;
-        if (k == lr->len || c == '\t' || m->missing[c]) {
-            if (k > segStart)
-                DrawText((Ptr)(t + lr->start), segStart, (short)(k - segStart));
-            if (k < lr->len && c == '\t') {
-                Point pt;
-                GetPen(&pt);
-                MoveTo((short)(r->left + kMargin + NextTab((short)(pt.h - r->left - kMargin))), pt.v);
-            } else if (k < lr->len && c == DOCX_CH_EURO) {
-                DrawEuro(m->widths[c], m->ascent, (Boolean)(m->face != 0));
-            } else if (k < lr->len) {
-                const char *sub = GlyphStandIn(c);
-                short n = 0;
-                while (sub[n])
-                    n++;
-                DrawText((Ptr)sub, 0, n);
-            }
-            segStart = (short)(k + 1);
+    WalkStart(&wk, lr);
+    UseFont(wk.m);
+    MoveTo((short)(org + wk.x), base);
+    for (k = a; k <= b; k++) {
+        unsigned char c = (k < b) ? t[k] : 0;
+        Boolean special = (Boolean)(k == b || c < 0x20 || wk.m->missing[c]);
+        if (!special) {
+            WalkStep(&wk, c, lr->left);
+            continue;
+        }
+        if (k > seg)
+            DrawText((Ptr)(t + seg), 0, (short)(k - seg));
+        seg = k + 1;
+        if (k == b)
+            break;
+        if (DOCX_IS_FACE(c) || DOCX_IS_SIZE(c)) {
+            WalkStep(&wk, c, lr->left);
+            UseFont(wk.m);
+        } else if (c == '\t') {
+            WalkStep(&wk, c, lr->left);
+            MoveTo((short)(org + wk.x), base);
+        } else if (c == DOCX_CH_EURO) {
+            DrawEuro(wk.m->widths[c], wk.m->ascent, (Boolean)((wk.s.face & bold) != 0));
+            WalkStep(&wk, c, lr->left);
+        } else if (c == 0xE1) {                 /* middle dot, at half x-height */
+            Point pen;
+            Rect dot;
+            short sz = (short)(wk.m->size >= 14 ? 2 : 1);
+            GetPen(&pen);
+            SetRect(&dot, (short)(pen.h + (wk.m->widths[c] - sz) / 2),
+                    (short)(base - (wk.m->ascent * 3) / 8 - sz / 2), 0, 0);
+            dot.right = (short)(dot.left + sz + ((wk.s.face & bold) ? 1 : 0));
+            dot.bottom = (short)(dot.top + sz + ((wk.s.face & bold) ? 1 : 0));
+            PaintRect(&dot);
+            WalkStep(&wk, c, lr->left);
+            MoveTo((short)(org + wk.x), base);
+        } else if (c >= 0x20) {
+            const char *sub = GlyphStandIn(c);
+            short n = 0;
+            while (sub[n])
+                n++;
+            DrawText((Ptr)sub, 0, n);
+            WalkStep(&wk, c, lr->left);
         }
     }
     if (d->active && d->selEnd > d->selStart && d->selStart < next && d->selEnd > a) {
         Rect h = lineR;
-        h.left = (short)(r->left + kMargin + (d->selStart <= a ? 0 : LineX(t, lr, d->selStart)));
-        if (d->selStart <= a && i > 0)
-            h.left = r->left;
+        if (d->selStart > a)
+            h.left = (short)(org + LineX(t, lr, d->selStart));
         if (d->selEnd <= b)
-            h.right = (short)(r->left + kMargin + LineX(t, lr, d->selEnd));
+            h.right = (short)(org + LineX(t, lr, d->selEnd));
         LMSetHiliteMode((UInt8)(LMGetHiliteMode() & 0x7F));   /* highlight colour */
         InvertRect(&h);
     }
@@ -608,7 +771,7 @@ static void DrawLines(WindowPtr w, long from, long to)
     Rect r;
     RgnHandle saveClip;
     long i;
-    short y;
+    short top;
     unsigned char *t;
 
     if (d == 0)
@@ -623,19 +786,19 @@ static void DrawLines(WindowPtr w, long from, long to)
     HLock(d->text);
     HLock(d->lines);
     t = (unsigned char *)*d->text;
-    y = (short)(r.top + kMargin / 2);
-    for (i = d->top; i < d->nLines && y < r.bottom; i++) {
+    top = (short)(r.top + kMargin / 2);
+    for (i = d->top; i < d->nLines && top < r.bottom; i++) {
         LineRec *lr = (LineRec *)*d->lines + i;
         long next = (i + 1 < d->nLines) ? lr[1].start : d->len + 1;
-        y += LineHeight(lr);
         if (from < 0)
-            DrawLine(w, d, t, i, y, &r, false);
+            DrawLine(d, t, i, top, &r, false);
         else if (from < next && to >= lr->start)
-            DrawLine(w, d, t, i, y, &r, true);
+            DrawLine(d, t, i, top, &r, true);
+        top += lr->height;
     }
     HUnlock(d->lines);
     HUnlock(d->text);
-    SetStyle(kStyleBody);
+    UseFont(GetM(0, gBodyIdx));
     SetClip(saveClip);
     DisposeRgn(saveClip);
 }
@@ -676,7 +839,7 @@ static long PageLines(WindowPtr w)
     Rect r;
     long n;
     ContentRect(w, &r);
-    n = (r.bottom - r.top) / gMetrics[kStyleBody].height - 1;
+    n = (r.bottom - r.top) / GetM(0, gBodyIdx)->height - 1;
     return n < 1 ? 1 : n;
 }
 
@@ -714,7 +877,7 @@ static long PointToPos(WindowPtr w, Point pt)
     i = d->top;
     if (pt.v >= y) {
         for (; i < d->nLines; i++) {
-            y += LineHeight((LineRec *)*d->lines + i);
+            y += ((LineRec *)*d->lines)[i].height;
             if (pt.v < y)
                 break;
         }
@@ -728,6 +891,27 @@ static long PointToPos(WindowPtr w, Point pt)
     pos = LinePos((unsigned char *)*d->text, lr, (short)(pt.h - r.left - kMargin));
     HUnlock(d->text);
     return pos;
+}
+
+/* Plain text for the outside world (clipboard, Save as Text): formatting
+   bytes dropped, line breaks as CR, € spelt EUR (System 7 has no €).
+   Writes the bytes for t[*i] to out (if given), advances *i, returns the count. */
+static short PlainBytes(const unsigned char *t, long len, long *i, unsigned char *out)
+{
+    unsigned char c = t[*i];
+    long skip = docx_ctrl_len(t, *i, len);
+    if (skip) {
+        *i += skip;
+        return 0;
+    }
+    (*i)++;
+    if (c == DOCX_CH_EURO) {
+        if (out) { out[0] = 'E'; out[1] = 'U'; out[2] = 'R'; }
+        return 3;
+    }
+    if (out)
+        out[0] = (unsigned char)(c == DOCX_CH_LINEBREAK ? '\r' : c);
+    return 1;
 }
 
 static Boolean IsWordChar(unsigned char c)
@@ -746,11 +930,19 @@ static Boolean IsWordChar(unsigned char c)
 static void WordAt(DocPtr d, long pos, long *a, long *b)
 {
     unsigned char *t = (unsigned char *)*d->text;
+    long ps, cs;
+    ParaInfo pi;
     *a = *b = pos;
     while (*a > 0 && IsWordChar(t[*a - 1]))
         (*a)--;
     while (*b < d->len && IsWordChar(t[*b]))
         (*b)++;
+    /* not into the paragraph's prefix (its record bytes look like text) */
+    for (ps = pos; ps > 0 && t[ps - 1] != '\r'; ps--)
+        ;
+    cs = ParsePara(t, ps, d->len, &pi);
+    if (*a < cs)
+        *a = cs;
 }
 
 /* Change the selection, redrawing only the lines whose highlight changes. */
@@ -832,8 +1024,8 @@ static void DoCopy(WindowPtr w)
     if (d == 0 || d->selEnd <= d->selStart)
         return;
     t = (unsigned char *)*d->text;
-    for (i = d->selStart; i < d->selEnd; i++)
-        need += (t[i] == DOCX_CH_EURO) ? 3 : DOCX_IS_MARKER(t[i]) ? 0 : 1;
+    for (i = d->selStart; i < d->selEnd; )
+        need += PlainBytes(t, d->len, &i, 0);
     h = NewHandle(need);
     if (h == 0) {
         SysBeep(1);
@@ -843,13 +1035,8 @@ static void DoCopy(WindowPtr w)
     HLock(d->text);
     t = (unsigned char *)*d->text;
     o = (unsigned char *)*h;
-    for (i = d->selStart; i < d->selEnd; i++) {
-        unsigned char c = t[i];
-        if (c == DOCX_CH_EURO) {
-            o[n++] = 'E'; o[n++] = 'U'; o[n++] = 'R';
-        } else if (!DOCX_IS_MARKER(c))
-            o[n++] = c;
-    }
+    for (i = d->selStart; i < d->selEnd; )     /* the same walk as the count */
+        n += PlainBytes(t, d->len, &i, o + n);
     HUnlock(d->text);
     ZeroScrap();
     if (PutScrap(n, 'TEXT', (Ptr)*h) != noErr)
@@ -1103,13 +1290,8 @@ static void DoSaveText(WindowPtr w)
     p = 0;
     while (p < d->len && err == noErr) {
         n = 0;
-        while (p < d->len && n < (long)sizeof(buf) - 2) {   /* room for "EUR" */
-            unsigned char c = (unsigned char)(*d->text)[p++];
-            if (c == DOCX_CH_EURO) {        /* TeachText under System 7 has no € */
-                buf[n++] = 'E'; buf[n++] = 'U'; buf[n++] = 'R';
-            } else if (!DOCX_IS_MARKER(c))
-                buf[n++] = (char)c;
-        }
+        while (p < d->len && n < (long)sizeof(buf) - 2)     /* room for "EUR" */
+            n += PlainBytes((unsigned char *)*d->text, d->len, &p, (unsigned char *)buf + n);
         err = FSWrite(ref, &n, buf);
     }
     HUnlock(d->text);
@@ -1125,7 +1307,9 @@ static void DoInfo(WindowPtr w)
     if (d == 0)
         return;
     a[0] = 0;
-    CCat(a, d->st.format == DOCX_FMT_FLATXML ? "Word XML (single file)" : "Office Open XML package");
+    CCat(a, d->st.format == DOCX_FMT_FLATXML ? "Word XML (single file)" :
+            d->st.format == DOCX_FMT_ODT ? "OpenDocument text" :
+            d->st.format == DOCX_FMT_FLATODT ? "OpenDocument flat XML" : "Office Open XML package");
     CCat(a, ", part ");
     CCat(a, d->st.part[0] ? d->st.part : "-");
     CCat(a, ". ");
@@ -1204,10 +1388,9 @@ static void SetTextSize(short item)
     short i;
     if (item < 1 || item > 5)
         return;
-    gBaseSize = kSizes[item - 1];
     for (i = 1; i <= 5; i++)
         CheckItem(view, i, i == item);
-    ComputeMetrics();
+    SetBodySize(kSizes[item - 1]);
     for (w = FrontWindow(); w; w = (WindowPtr)((WindowPeek)w)->nextWindow) {
         DocPtr d = DocOf(w);
         if (d) {
@@ -1465,7 +1648,7 @@ int main(void)
 
     gScrollUPP = NewControlActionUPP(ScrollAction);
     SetupMenus();
-    ComputeMetrics();
+    SetBodySize(12);
     InstallAEs();
 
     while (!gQuit) {
