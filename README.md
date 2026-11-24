@@ -26,8 +26,8 @@ text size per run (snapped to Geneva's bitmap sizes, so it stays crisp);
 headings (Title, Heading 1–3, German *Überschrift*, ODF `text:h`); bullets
 with hanging indents (list indents from `numbering.xml`); tables (cells
 tab-separated, rows per line); tabs and line breaks; **pictures** (PNG and
-JPEG, in 16 greys — see below; other formats as a labelled box). Footnote
-bodies and comments are left out. File ▸ Save as Text writes
+JPEG, in 16 greys — see below; other formats as a labelled box); footnotes
+and endnotes (see below). Comments are left out. File ▸ Save as Text writes
 a TeachText file (MacRoman, CR). Text can be selected (drag, Shift-click,
 double-click for words, ⌘A) and copied (⌘C) to the clipboard as plain MacRoman
 text. File ▸ Document Info reports what the conversion had to do.
@@ -45,6 +45,25 @@ lays that out; Copy and Save as Text drop it.
 | paragraph | `w:pPr`: `w:spacing`, `w:ind`, `w:jc`; defaults from `styles.xml` `w:docDefaults` | `style:paragraph-properties` `fo:margin-*`, `fo:text-indent`, `fo:text-align`, through `parent-style-name` |
 | run | `w:rPr`: `w:b`, `w:i`, `w:u`, `w:sz` | `text:span` → `style:text-properties` `fo:font-weight`, `fo:font-style`, `fo:font-size` (pt or %) |
 | list | `w:numPr` → `numbering.xml` indents | nested `text:list` |
+| note | `w:footnoteReference` / `w:endnoteReference` → `footnotes.xml`, `endnotes.xml` (Word 2003: inline `w:footnote`) | `text:note` with `text:note-class` |
+
+### Footnotes and endnotes
+
+A reference becomes a small raised number in the text (`DOCX_SUP_ON`, the
+label, `DOCX_SUP_OFF`): 1, 2, 3 for footnotes, i, ii, iii for endnotes, the
+defaults of Word and LibreOffice. The viewer has no pages, so the notes follow
+the body, under the headings *Footnotes* and *Endnotes*, one smaller paragraph
+each with its number hanging in the margin. Copy and Save as Text write the
+reference as `[1]`.
+
+Nothing is buffered for this: references are numbered as they stream past
+(Word's `w:id` is remembered for up to 500 notes of each kind), and the notes
+are read in a second pass. For Word this pass reads `footnotes.xml` /
+`endnotes.xml`, wherever `document.xml.rels` puts them. For OpenDocument and
+the single-file formats it reads the same XML again with everything outside
+the notes skipped. Word's separator notes and notes the text never refers to
+are left out; a custom mark (`w:customMarkFollows`) is shown as Word's own
+text. Document Info counts both kinds.
 
 ### Pictures
 
@@ -145,6 +164,7 @@ tests/wrcat -fmt samples/Duo-Demo.odt         # text with the formatting bytes s
 tests/wrcat -pic word/media/image2.jpg out.pgm 432 270 samples/Pictures-Demo.docx   # decode one picture
 python3 tests/fuzz.py 3000 pic.png photo.jpg  # pictures go through the decoder at random sizes
 uv run --with python-docx --with odfpy --with pillow --with numpy python tools/make_sample_pictures.py
+uv run --with python-docx --with odfpy python tools/make_sample_notes.py   # samples/Notes-Demo.docx/.odt
 
 # Mac: compile/link/Rez on dev2019, then install on the Duo
 uv run python tools/build_mac.py            # WordReader

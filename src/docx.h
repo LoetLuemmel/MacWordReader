@@ -38,6 +38,13 @@
    0x18 + step + 2       run size from here on, in steps relative to body
                          text (-2 .. +5); the viewer maps steps to real sizes
    DOCX_CH_LINEBREAK     a line break inside a paragraph (keeps its indent)
+   DOCX_SUP_ON label DOCX_SUP_OFF
+                         a footnote / endnote reference: the label (digits,
+                         or roman numerals for endnotes) drawn small and
+                         raised; Copy and Save as Text write it as [label].
+                         The notes themselves follow the body, under a
+                         "Footnotes" / "Endnotes" heading, one paragraph
+                         each starting "label<tab>".
 
    DOCX_PIC + 5 bytes + name
                          a picture, alone on its line in the viewer: width
@@ -55,6 +62,9 @@
 #define DOCX_PIC          0x07
 #define DOCX_PIC_HEAD     6
 #define DOCX_PIC_NAMEMAX  90
+#define DOCX_SUP_ON       0x0E
+#define DOCX_SUP_OFF      0x0F
+#define DOCX_IS_SUP(c)    ((c) == DOCX_SUP_ON || (c) == DOCX_SUP_OFF)
 #define DOCX_IS_FACE(c)   ((c) >= 0x10 && (c) <= 0x17)
 #define DOCX_IS_SIZE(c)   ((c) >= 0x18 && (c) <= 0x1F)
 enum { DOCX_AL_LEFT = 0, DOCX_AL_CENTER, DOCX_AL_RIGHT, DOCX_AL_JUSTIFY };
@@ -75,6 +85,8 @@ typedef struct {
     long   paragraphs;
     long   tables;
     long   pictures;
+    long   footnotes;      /* references in the text */
+    long   endnotes;
     long   lossy;          /* characters shown as '?' */
     long   substituted;    /* characters spelt with a stand-in (1/2, L for Ł) */
     long   euros;          /* € signs (DOCX_CH_EURO) */

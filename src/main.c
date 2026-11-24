@@ -85,10 +85,12 @@ QDGlobals qd;
 #define rAlertAbout   129
 #define rAlertInfo    130
 
-/* run face and size: QuickDraw face bits, size step from body text */
+/* run face and size: QuickDraw face bits, size step from body text;
+   sup: inside a note reference (DOCX_SUP_ON .. DOCX_SUP_OFF) */
 typedef struct {
     unsigned char face;
     signed char   step;
+    unsigned char sup;
 } RunState;
 
 typedef struct {
@@ -96,6 +98,7 @@ typedef struct {
     short         len;       /* bytes on this line, without the CR */
     unsigned char face;      /* run state where the line starts */
     signed char   step;
+    unsigned char sup;
     short         x0;        /* indent of the first character */
     short         left;      /* the paragraph's left indent (hanging tab stop) */
     short         shift;     /* centring / right alignment */
@@ -503,6 +506,7 @@ static long ParsePara(const unsigned char *t, long p, long end, ParaInfo *pi)
 /* A heading's look comes from its style marker. */
 static void MarkerState(unsigned char mk, RunState *s)
 {
+    s->sup = 0;
     s->face = (unsigned char)(mk ? bold : 0);
     s->step = (signed char)(mk == DOCX_MK_TITLE ? 3 : mk == DOCX_MK_H1 ? 2 : mk == DOCX_MK_H2 ? 1 : 0);
 }
@@ -520,13 +524,28 @@ typedef struct {
     RunState s;
     Metrics *m;
     short    x;          /* logical x: 0 = left margin, before alignment */
+    short    rise;       /* a note reference: its baseline is this much higher */
 } Walker;
+
+/* The metrics for a run state: a note reference two sizes smaller, raised
+   by a third of the run's own ascent. */
+static void WalkFont(Walker *w)
+{
+    if (w->s.sup) {
+        w->rise = (short)(GetM(w->s.face, SizeIdx(w->s.step))->ascent / 3);
+        w->m = GetM(w->s.face, SizeIdx((short)(w->s.step - 2)));
+    } else {
+        w->rise = 0;
+        w->m = GetM(w->s.face, SizeIdx(w->s.step));
+    }
+}
 
 static void WalkStart(Walker *w, const LineRec *lr)
 {
     w->s.face = lr->face;
     w->s.step = lr->step;
-    w->m = GetM(w->s.face, SizeIdx(w->s.step));
+    w->s.sup = lr->sup;
+    WalkFont(w);
     w->x = lr->x0;
 }
 
@@ -536,12 +555,17 @@ static short WalkStep(Walker *w, unsigned char c, short left)
     short cw;
     if (DOCX_IS_FACE(c)) {
         w->s.face = (unsigned char)(c - DOCX_FACE0);
-        w->m = GetM(w->s.face, SizeIdx(w->s.step));
+        WalkFont(w);
         return 0;
     }
     if (DOCX_IS_SIZE(c)) {
         w->s.step = (signed char)(c - DOCX_SIZE0 - 2);
-        w->m = GetM(w->s.face, SizeIdx(w->s.step));
+        WalkFont(w);
+        return 0;
+    }
+    if (DOCX_IS_SUP(c)) {
+        w->s.sup = (unsigned char)(c == DOCX_SUP_ON);
+        WalkFont(w);
         return 0;
     }
     cw = (c == '\t') ? (short)(NextTab(w->x, left) - w->x) : w->m->widths[c];
@@ -631,7 +655,7 @@ static void Layout(WindowPtr w)
         do {
             /* where does this line end? */
             wk.s = st;
-            wk.m = GetM(st.face, SizeIdx(st.step));
+            WalkFont(&wk);
             wk.x = x0;
             lastBreak = -1;
             placed = false;
@@ -656,6 +680,7 @@ static void Layout(WindowPtr w)
                 st = wk.s;                      /* run changes just before it */
                 lr.face = st.face;
                 lr.step = st.step;
+                lr.sup = st.sup;
                 lr.x0 = x0;
                 lr.left = left;
                 PicSize(t, i, end, (short)(maxW - x0), maxH, &lr.pw, &lr.ph);
@@ -691,20 +716,22 @@ static void Layout(WindowPtr w)
             lr.len = (short)(lineEnd - lineStart);
             lr.face = st.face;
             lr.step = st.step;
+            lr.sup = st.sup;
             lr.x0 = x0;
             lr.left = left;
             lr.shift = 0;
             lr.pw = lr.ph = 0;
             WalkStart(&wk, &lr);
             {
-                short asc = wk.m->ascent, desc = (short)(wk.m->height - wk.m->ascent);
+                short asc = (short)(wk.m->ascent + wk.rise);
+                short desc = (short)(wk.m->height - wk.m->ascent - wk.rise);
                 short xEnd = x0, content;
                 for (k = lineStart; k < lineEnd; k++) {
                     unsigned char c = t[k];
                     if (WalkStep(&wk, c, left) > 0 || c == ' ') {
-                        if (wk.m->ascent > asc) asc = wk.m->ascent;
-                        if (wk.m->height - wk.m->ascent > desc)
-                            desc = (short)(wk.m->height - wk.m->ascent);
+                        if (wk.m->ascent + wk.rise > asc) asc = (short)(wk.m->ascent + wk.rise);
+                        if (wk.m->height - wk.m->ascent - wk.rise > desc)
+                            desc = (short)(wk.m->height - wk.m->ascent - wk.rise);
                         if (c != ' ' && c != '\t')
                             xEnd = wk.x;
                     }
@@ -1125,7 +1152,7 @@ static void DrawLine(DocPtr d, const unsigned char *t, long i, short top,
     }
     WalkStart(&wk, lr);
     UseFont(wk.m);
-    MoveTo((short)(org + wk.x), base);
+    MoveTo((short)(org + wk.x), (short)(base - wk.rise));
     for (k = a; k <= b; k++) {
         unsigned char c = (k < b) ? t[k] : 0;
         Boolean special = (Boolean)(k == b || c < 0x20 || wk.m->missing[c]);
@@ -1138,12 +1165,13 @@ static void DrawLine(DocPtr d, const unsigned char *t, long i, short top,
         seg = k + 1;
         if (k == b)
             break;
-        if (DOCX_IS_FACE(c) || DOCX_IS_SIZE(c)) {
+        if (DOCX_IS_FACE(c) || DOCX_IS_SIZE(c) || DOCX_IS_SUP(c)) {
             WalkStep(&wk, c, lr->left);
             UseFont(wk.m);
+            MoveTo((short)(org + wk.x), (short)(base - wk.rise));
         } else if (c == '\t') {
             WalkStep(&wk, c, lr->left);
-            MoveTo((short)(org + wk.x), base);
+            MoveTo((short)(org + wk.x), (short)(base - wk.rise));
         } else if (c == DOCX_CH_EURO) {
             DrawEuro(wk.m->widths[c], wk.m->ascent, (Boolean)((wk.s.face & bold) != 0));
             WalkStep(&wk, c, lr->left);
@@ -1153,12 +1181,12 @@ static void DrawLine(DocPtr d, const unsigned char *t, long i, short top,
             short sz = (short)(wk.m->size >= 14 ? 2 : 1);
             GetPen(&pen);
             SetRect(&dot, (short)(pen.h + (wk.m->widths[c] - sz) / 2),
-                    (short)(base - (wk.m->ascent * 3) / 8 - sz / 2), 0, 0);
+                    (short)(base - wk.rise - (wk.m->ascent * 3) / 8 - sz / 2), 0, 0);
             dot.right = (short)(dot.left + sz + ((wk.s.face & bold) ? 1 : 0));
             dot.bottom = (short)(dot.top + sz + ((wk.s.face & bold) ? 1 : 0));
             PaintRect(&dot);
             WalkStep(&wk, c, lr->left);
-            MoveTo((short)(org + wk.x), base);
+            MoveTo((short)(org + wk.x), (short)(base - wk.rise));
         } else if (c >= 0x20) {
             const char *sub = GlyphStandIn(c);
             short n = 0;
@@ -1336,6 +1364,12 @@ static short PlainBytes(const unsigned char *t, long len, long *i, unsigned char
         for (k = 0; out && k < 9; k++)
             out[k] = (unsigned char)kPic[k];
         return 9;
+    }
+    if (DOCX_IS_SUP(c)) {               /* a note reference: [1] */
+        (*i)++;
+        if (out)
+            out[0] = (unsigned char)(c == DOCX_SUP_ON ? '[' : ']');
+        return 1;
     }
     if (skip) {
         *i += skip;
@@ -1770,6 +1804,10 @@ static void DoInfo(WindowPtr w)
     NumToPStrSep(d->st.paragraphs, n); PCat(b, n); CCat(b, " paragraphs, ");
     NumToPStrSep(d->st.tables, n);     PCat(b, n); CCat(b, " tables, ");
     NumToPStrSep(d->st.pictures, n);   PCat(b, n); CCat(b, " pictures, ");
+    if (d->st.footnotes + d->st.endnotes > 0) {
+        NumToPStrSep(d->st.footnotes, n); PCat(b, n); CCat(b, " footnotes, ");
+        NumToPStrSep(d->st.endnotes, n);  PCat(b, n); CCat(b, " endnotes, ");
+    }
     NumToPStrSep(d->nLines, n);        PCat(b, n); CCat(b, " lines.");
     if (d->picCount > 0) {
         CCat(b, " Pictures decoded so far: ");

@@ -24,6 +24,7 @@
 #include "macroman.h"
 
 #define TAGMAX 600          /* ODF style tags carry many attributes */
+#define NOTEMAX 500         /* footnote ids remembered per kind */
 
 enum { M_TEXT, M_TAG, M_COMMENT, M_CDATA };
 
@@ -86,6 +87,19 @@ typedef struct {
     struct { char id[16]; char target[DOCX_PIC_NAMEMAX + 1]; } rels[48];
     short  inDrawing, picDone, sawPic;
     long   picW, picH;      /* points */
+
+    /* footnotes ('f') and endnotes ('e'): references numbered as they occur
+       in the body; the notes are read in a later pass (p->notes) and follow
+       the body. Everything outside a note is skipped then: skipDepth 1. */
+    char   notePart[2][DOCX_PIC_NAMEMAX + 1];  /* word/footnotes.xml, word/endnotes.xml */
+    short  nRef[2];         /* references seen (numbers given) */
+    short  nIdx[2];         /* entries in ref[] */
+    struct { long id; short num; } ref[2][NOTEMAX];   /* num 0: a custom mark */
+    char   notes;           /* 0: the body; 'f' / 'e': reading those notes */
+    short  noteOpen;        /* inside one of them */
+    short  notePend;        /* ODF: a matching text:note, its body not yet open */
+    short  noteSeq;         /* notes without an id, in order */
+    char   label[12];       /* to be written at the note's first content */
 
     struct OdfCtx *odf;     /* set while reading OpenDocument */
 } Parser;
@@ -162,7 +176,7 @@ static wr_u8 Clamp200(long v)
 /* The paragraph record: spacing, indents, alignment (see docx.h). */
 static void EmitParaRec(Parser *p)
 {
-    long left = p->left, first = p->first;
+    long left = p->left, first = p->first, after = p->after;
     short i;
     if (p->paraRec || p->tblDepth > 0)
         return;
@@ -181,9 +195,16 @@ static void EmitParaRec(Parser *p)
                 break;
             }
     }
+    if (p->noteOpen) {                  /* notes: the label hangs in the margin */
+        if (left < 340)
+            left = 360;
+        first = p->label[0] ? -left : 0;
+        if (after > 60)
+            after = 60;                 /* 3 pt: Word's footnote style has none */
+    }
     Emit(p, DOCX_PARA);
     Emit(p, Clamp200(p->before / 20));
-    Emit(p, Clamp200(p->after / 20));
+    Emit(p, Clamp200(after / 20));
     Emit(p, Clamp200(left / 40));
     Emit(p, Clamp200(first / 40 + 100));
     Emit(p, (wr_u8)(0x20 + p->align));
@@ -208,6 +229,8 @@ static void ApplyRun(Parser *p)
     if (p->marker && p->tblDepth == 0)
         return;
     step = SizeStep(p->runSz, p->defSz);
+    if (p->noteOpen && step > -1)
+        step = -1;                      /* notes: a size smaller than the body */
     if (p->runFace != p->emFace) {
         Emit(p, (wr_u8)(DOCX_FACE0 + p->runFace));
         p->emFace = p->runFace;
@@ -255,8 +278,99 @@ static void StartContent(Parser *p)
             Emit(p, 0xA5);        /* MacRoman bullet, then a tab to the hanging indent */
             Emit(p, (wr_u8)(p->tblDepth > 0 ? ' ' : '\t'));
         }
+        if (p->label[0]) {              /* a note's number, plain, then a tab */
+            short face = p->runFace, sz = p->runSz;
+            p->runFace = p->runSz = 0;
+            ApplyRun(p);
+            EmitStr(p, p->label);
+            Emit(p, '\t');
+            p->label[0] = 0;
+            p->runFace = face;
+            p->runSz = sz;
+        }
     }
     ApplyRun(p);
+}
+
+/* A note's label: 1, 2, 3 for footnotes; i, ii, iii for endnotes (the
+   defaults of Word and LibreOffice). n <= 0: none. */
+static void NoteLabel(char kind, short n, char *s)
+{
+    static const char *kOnes[10] = { "", "i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix" };
+    static const char *kTens[10] = { "", "x", "xx", "xxx", "xl", "l", "lx", "lxx", "lxxx", "xc" };
+    short k = 0, i;
+    char d[8];
+    s[0] = 0;
+    if (n <= 0)
+        return;
+    if (kind == 'e' && n < 400) {
+        for (i = 0; i < n / 100; i++)
+            s[k++] = 'c';
+        for (i = 0; kTens[(n / 10) % 10][i]; i++)
+            s[k++] = kTens[(n / 10) % 10][i];
+        for (i = 0; kOnes[n % 10][i]; i++)
+            s[k++] = kOnes[n % 10][i];
+    } else {
+        for (i = 0; n > 0 && i < 7; n /= 10)
+            d[i++] = (char)('0' + n % 10);
+        while (i > 0)
+            s[k++] = d[--i];
+    }
+    s[k] = 0;
+}
+
+/* A reference to a note in the body: its number, raised. id: the note's
+   w:id, or -1 when it has none (ODF, Word 2003's inline notes).
+   custom: Word's customMarkFollows - the run's own text is the mark. */
+static void EmitNoteRef(Parser *p, char kind, long id, short custom)
+{
+    short k = (short)(kind == 'e'), num = 0;
+    char lab[12];
+    if (!custom && p->nRef[k] < 32000)
+        num = ++p->nRef[k];
+    if (p->nIdx[k] < NOTEMAX) {
+        p->ref[k][p->nIdx[k]].id = id;
+        p->ref[k][p->nIdx[k]].num = num;
+        p->nIdx[k]++;
+    }
+    if (kind == 'e')
+        p->st->endnotes++;
+    else
+        p->st->footnotes++;
+    if (num == 0)
+        return;
+    StartContent(p);
+    NoteLabel(kind, num, lab);
+    Emit(p, DOCX_SUP_ON);
+    EmitStr(p, lab);
+    Emit(p, DOCX_SUP_OFF);
+    p->st->chars -= 2;
+}
+
+/* Notes pass: the note with this id (-1: the next one without) begins;
+   its label, or 0 when the body never referred to it. */
+static short NoteBegins(Parser *p, long id)
+{
+    short k = (short)(p->notes == 'e'), i, num;
+    if (id == -1) {                     /* in order: the n-th reference without an id */
+        short n = ++p->noteSeq;
+        num = n;
+        for (i = 0; i < p->nIdx[k]; i++)
+            if (p->ref[k][i].id == -1 && --n == 0) {
+                num = p->ref[k][i].num;
+                break;
+            }
+    } else {
+        for (i = 0; i < p->nIdx[k] && p->ref[k][i].id != id; i++)
+            ;
+        if (i >= p->nIdx[k])
+            return 0;                   /* not referred to (or beyond NOTEMAX) */
+        num = p->ref[k][i].num;
+    }
+    NoteLabel(p->notes, num, p->label);
+    p->noteOpen = 1;
+    p->skipDepth = 0;
+    return 1;
 }
 
 /* A picture: a DOCX_PIC item for a member we can read, else "[Picture]". */
@@ -295,21 +409,24 @@ static const char *RelTarget(Parser *p, const char *id)
     return 0;
 }
 
-/* Record an image relationship; Target is relative to partDir ("../" allowed,
-   "%20" decoded), or absolute with a leading '/'. */
+/* Record an image relationship, or where the footnotes and endnotes are;
+   Target is relative to partDir ("../" allowed, "%20" decoded), or absolute
+   with a leading '/'. */
 static void AddRel(Parser *p)
 {
     char id[16], type[120], target[DOCX_PIC_NAMEMAX + 1], mode[16], full[DOCX_PIC_NAMEMAX + 1];
-    short n, t, k, i;
-    if (p->nRel >= (short)(sizeof(p->rels) / sizeof(p->rels[0])))
-        return;
+    short n, t, k, i, what;
     if (!AttrVal(p->tag, "Id", id, sizeof(id)) || !AttrVal(p->tag, "Type", type, sizeof(type)) ||
         !AttrVal(p->tag, "Target", target, sizeof(target)))
         return;
     n = 0;
     while (type[n])
         n++;
-    if (n < 6 || !Eq(type + n - 6, "/image"))
+    what = (short)(n >= 6 && Eq(type + n - 6, "/image") ? 1 :
+                   n >= 10 && Eq(type + n - 10, "/footnotes") ? 2 :
+                   n >= 9 && Eq(type + n - 9, "/endnotes") ? 3 : 0);
+    if (what == 0 ||
+        (what == 1 && p->nRel >= (short)(sizeof(p->rels) / sizeof(p->rels[0]))))
         return;
     if (AttrVal(p->tag, "TargetMode", mode, sizeof(mode)) && Eq(mode, "External"))
         return;
@@ -343,6 +460,11 @@ static void AddRel(Parser *p)
         }
     }
     full[n] = 0;
+    if (what > 1) {
+        for (i = 0; i <= n; i++)
+            p->notePart[what - 2][i] = full[i];
+        return;
+    }
     k = p->nRel++;
     for (i = 0; id[i]; i++)
         p->rels[k].id[i] = id[i];
@@ -368,6 +490,8 @@ static void EmitCodePoint(Parser *p, wr_u32 cp)
         } else
             p->odf->space = 0;
     }
+    if (p->label[0] && (cp == ' ' || cp == '\t'))
+        return;                         /* "<footnoteRef/> Text": the label has its tab */
     if (cp < 0x20) {
         if (cp == 0x09)
             cp = '\t';
@@ -936,8 +1060,39 @@ static void OdfTag(Parser *p, const char *name, short closing, short selfClose)
     char v[48], par[48];
     short k;
 
-    /* not shown: notes, comments, deleted text; frames show as [Picture] */
-    if (Eq(name, "note-body") || Eq(name, "annotation") || Eq(name, "tracked-changes")) {
+    /* notes: text:note holds its citation and its body. In the body pass the
+       note leaves its number, raised; the notes pass shows each body. */
+    if (Eq(name, "note")) {
+        if (closing || selfClose) {
+            p->notePend = 0;
+            return;
+        }
+        AttrVal(p->tag, "note-class", v, sizeof(v));
+        if (p->notes)
+            p->notePend = (short)(p->skipDepth == 1 && !p->noteOpen &&
+                                  (Eq(v, "endnote") ? 'e' : 'f') == p->notes);
+        else if (p->skipDepth == 0 && p->inT)
+            EmitNoteRef(p, (char)(Eq(v, "endnote") ? 'e' : 'f'), -1, 0);
+        return;
+    }
+    if (Eq(name, "note-body") && p->notes) {
+        if (closing) {
+            if (p->noteOpen) {
+                p->noteOpen = 0;
+                p->label[0] = 0;
+                p->skipDepth = 1;
+            }
+        } else if (!selfClose && p->notePend) {
+            p->notePend = 0;
+            NoteBegins(p, -1);
+        }
+        return;
+    }
+
+    /* not shown: comments, deleted text, a note's citation (numbered here)
+       and its body in the text; frames show as [Picture] */
+    if (Eq(name, "note-body") || Eq(name, "note-citation") || Eq(name, "annotation") ||
+        Eq(name, "tracked-changes")) {
         OdfSkip(p, closing, selfClose);
         return;
     }
@@ -1137,8 +1292,43 @@ static void HandleTag(Parser *p)
             p->skipDepth++;
         return;
     }
+    /* a note's body: w:footnote in footnotes.xml, in a Flat OPC part, or
+       inline in a run (Word 2003 XML - then it is its reference, too) */
+    if (Eq(name, "footnote") || Eq(name, "endnote")) {
+        char kind = name[0];
+        if (selfClose)
+            return;
+        if (p->notes) {
+            if (closing) {
+                if (p->noteOpen) {
+                    p->noteOpen = 0;
+                    p->label[0] = 0;
+                    p->skipDepth = 1;
+                }
+            } else if (p->skipDepth == 1 && !p->noteOpen && kind == p->notes &&
+                       (!AttrVal(p->tag, "type", val, sizeof(val)) || Eq(val, "normal"))) {
+                NoteBegins(p, AttrNum(p->tag, "id", -1));
+            }
+            return;
+        }
+        if (closing)
+            p->skipDepth--;
+        else {
+            if (p->skipDepth == 0 && p->runDepth > 0)
+                EmitNoteRef(p, kind, AttrNum(p->tag, "id", -1), 0);
+            p->skipDepth++;
+        }
+        return;
+    }
     if (p->skipDepth > 0)
         return;
+    if ((Eq(name, "footnoteReference") || Eq(name, "endnoteReference")) && !closing) {
+        if (!p->notes)
+            EmitNoteRef(p, name[0], AttrNum(p->tag, "id", -1),
+                        (short)(AttrVal(p->tag, "customMarkFollows", val, sizeof(val)) &&
+                                !Eq(val, "0") && !Eq(val, "false") && !Eq(val, "off")));
+        return;
+    }
     if (p->skipStyle) {                 /* to the end of that style */
         if (closing && Eq(name, p->skipStyle == 2 ? "latentStyles" : "style"))
             p->skipStyle = 0;
@@ -1529,6 +1719,58 @@ static void InitParser(Parser *p, WrWriteFn wr, void *wctx, DocxStats *st)
     p->curAbs = p->curLvl = p->curNum = -1;
 }
 
+/* Between parts: the lexer and the body's state start afresh. */
+static void ResetPart(Parser *p)
+{
+    p->mode = M_TEXT;
+    p->inT = p->inEnt = p->need = 0;
+    p->runDepth = p->tblDepth = p->skipDepth = 0;
+    p->inPPr = p->inRPr = p->inDrawing = 0;
+    p->inPara = p->paraStarted = 0;
+    p->pendTab = p->cellSep = 0;
+    p->isList = 0;
+    p->marker = 0;
+    p->noteOpen = p->notePend = 0;
+    p->label[0] = 0;
+    if (p->odf) {
+        p->odf->listDepth = p->odf->itemFresh = p->odf->spanDepth = 0;
+        p->odf->frameLevel = p->odf->cur = -1;
+    }
+}
+
+/* Before reading the notes of one kind ('f', 'e'): their heading, then
+   everything is skipped except those notes. Returns 0 if there are none. */
+static short BeginNotes(Parser *p, char kind)
+{
+    if ((kind == 'e' ? p->st->endnotes : p->st->footnotes) == 0 || p->stopped)
+        return 0;
+    ResetPart(p);
+    p->notes = 0;
+    p->inPara = 1;
+    p->before = 360;                    /* twips */
+    p->after = 120;
+    p->left = p->first = 0;
+    p->align = DOCX_AL_LEFT;
+    p->hasInd = 0;
+    p->numId = -1;
+    p->paraRec = 0;
+    p->marker = DOCX_MK_H3;
+    StartContent(p);
+    EmitStr(p, kind == 'e' ? "Endnotes" : "Footnotes");
+    EndParagraph(p);
+    ResetPart(p);
+    p->notes = kind;
+    p->noteSeq = 0;
+    p->skipDepth = 1;
+    return 1;
+}
+
+static void EndNotes(Parser *p)
+{
+    ResetPart(p);
+    p->notes = 0;
+}
+
 static short Finish(Parser *p, short err)
 {
     Flush(p, 0);
@@ -1567,10 +1809,31 @@ static short ReadOdf(WrSource *src, Parser *p, DocxStats *st)
         err = zip_extract(src, &e, XmlFeed, p);
     else
         err = DOCX_ERR_FORMAT;
+    for (i = 0; i < 2 && err == ZIP_OK; i++)    /* the notes: content.xml again */
+        if (BeginNotes(p, (char)(i ? 'e' : 'f'))) {
+            zip_extract(src, &e, XmlFeed, p);
+            EndNotes(p);
+        }
     err = Finish(p, err);
     WR_FREE(p->odf);
     p->odf = 0;
     return err;
+}
+
+/* A single-file document from offset off through the parser. */
+static short FeedFile(WrSource *src, wr_u32 off, Parser *p, wr_u8 *buf, long size)
+{
+    while (off < src->size && !p->stopped) {
+        long want = (long)(src->size - off), n;
+        if (want > size)
+            want = size;
+        n = src->readAt(src->ctx, off, buf, want);
+        if (n <= 0)
+            return ZIP_ERR_READ;
+        XmlFeed(p, buf, n);
+        off += (wr_u32)n;
+    }
+    return DOCX_OK;
 }
 
 short docx_convert(WrSource *src, WrWriteFn wr, void *wctx, DocxStats *st)
@@ -1683,6 +1946,24 @@ short docx_convert(WrSource *src, WrWriteFn wr, void *wctx, DocxStats *st)
                 }
             st->xmlBytes = 0;
             err = zip_extract(src, &e, XmlFeed, p);
+            /* footnotes.xml, endnotes.xml: where document.xml.rels says */
+            for (k = 0; k < 2 && err == ZIP_OK; k++) {
+                char kind = (char)(k ? 'e' : 'f');
+                const char *np = p->notePart[k];
+                if (np[0] == 0) {
+                    const char *nm = k ? "endnotes.xml" : "footnotes.xml";
+                    for (j = 0; p->partDir[j]; j++)
+                        rels[j] = p->partDir[j];
+                    while (*nm)
+                        rels[j++] = *nm++;
+                    rels[j] = 0;
+                    np = rels;
+                }
+                if (zip_find(src, np, &aux) == ZIP_OK && BeginNotes(p, kind)) {
+                    zip_extract(src, &aux, XmlFeed, p);
+                    EndNotes(p);
+                }
+            }
         }
         err = Finish(p, err);
         WR_FREE(p);
@@ -1717,18 +1998,12 @@ short docx_convert(WrSource *src, WrWriteFn wr, void *wctx, DocxStats *st)
                 }
             }
         }
-        while (off < src->size && err == DOCX_OK && !p->stopped) {
-            long want = (long)(src->size - off);
-            if (want > (long)sizeof(buf))
-                want = sizeof(buf);
-            n = src->readAt(src->ctx, off, buf, want);
-            if (n <= 0)
-                err = ZIP_ERR_READ;
-            else {
-                XmlFeed(p, buf, n);
-                off += (wr_u32)n;
+        err = FeedFile(src, off, p, buf, sizeof(buf));
+        for (i = 0; i < 2 && err == DOCX_OK; i++)   /* the notes: the file again */
+            if (BeginNotes(p, (char)(i ? 'e' : 'f'))) {
+                FeedFile(src, off, p, buf, sizeof(buf));
+                EndNotes(p);
             }
-        }
         if (err == DOCX_OK && st->paragraphs == 0)
             err = DOCX_ERR_FORMAT;     /* XML, but no WordprocessingML in it */
         err = Finish(p, err);
@@ -1746,7 +2021,7 @@ long docx_ctrl_len(const wr_u8 *t, long i, long len)
 {
     wr_u8 c = t[i];
     long n;
-    if (DOCX_IS_MARKER(c) || DOCX_IS_FACE(c) || DOCX_IS_SIZE(c))
+    if (DOCX_IS_MARKER(c) || DOCX_IS_FACE(c) || DOCX_IS_SIZE(c) || DOCX_IS_SUP(c))
         return 1;
     if (c == DOCX_PARA)
         return (i + DOCX_PARA_LEN <= len) ? DOCX_PARA_LEN : len - i;
