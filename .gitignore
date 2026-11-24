@@ -5,3 +5,8 @@ tests/wrcat_asan
 tests/wrcat_asan.dSYM/
 gif/rec_*.log
 __pycache__/
+# kept locally only: screenshots from the dev2019 desktop
+gif/WordReader-making-of.gif
+gif/storyboard.json
+gif/frames/dev2019/
+gif/frames/manual/
