@@ -4,6 +4,11 @@ A System 7 application that opens today's Microsoft Word documents on a
 PowerBook Duo 230 (68030, 33 MHz, 8 MB). Built with MPW (SC 8.9, Universal
 Interfaces 3.4) on the dev2019 guest, deployed to the Duo over AppleBridge.
 
+![WordReader 1.2 on the PowerBook Duo 230](gif/WordReader-Duo.gif)
+
+Download: [releases](https://github.com/LoetLuemmel/MacWordReader/releases) (a
+1.44 MB disk image with the app and demo documents, or the app as MacBinary).
+
 ## What it reads
 
 | Format | How it is recognised |

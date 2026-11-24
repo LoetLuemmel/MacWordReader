@@ -3,6 +3,8 @@
 Frames come from gif/frames/dev2019 (framebuffer recorder) and gif/frames/duo
 (DuoShot helper); gif/storyboard.json says which frames to use, in what order,
 with which caption and for how long. Title cards are drawn here.
+  uv run --with pillow python tools/make_gif.py [storyboard.json [out.gif]]
+(both relative to gif/; default storyboard.json -> WordReader-making-of.gif)
 """
 import json, os, sys
 from PIL import Image, ImageDraw, ImageFont
@@ -48,7 +50,10 @@ def frame(path, tag, caption, crop=None):
     return canvas
 
 
-def card(title, lines):
+FOOTER = "MacWordReader · MPW on System 7.6.1 · 2026-11-23"
+
+
+def card(title, lines, footer=None):
     canvas = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(canvas)
     d.text((48, 150), title, font=font(34, True), fill=ACCENT)
@@ -58,16 +63,18 @@ def card(title, lines):
             d.text((48, y), part, font=font(19), fill=FG)
             y += 27
         y += 10
-    d.text((48, H - 44), "MacWordReader · MPW on System 7.6.1 · 2026-11-23", font=font(13), fill=DIM)
+    d.text((48, H - 44), footer or FOOTER, font=font(13), fill=DIM)
     return canvas
 
 
 def main():
-    story = json.load(open(os.path.join(ROOT, "storyboard.json")))
+    board = sys.argv[1] if len(sys.argv) > 1 else "storyboard.json"
+    name = sys.argv[2] if len(sys.argv) > 2 else "WordReader-making-of.gif"
+    story = json.load(open(os.path.join(ROOT, board)))
     frames, durations = [], []
     for s in story:
         if "card" in s:
-            frames.append(card(s["card"], s.get("lines", [])))
+            frames.append(card(s["card"], s.get("lines", []), s.get("footer")))
         else:
             frames.append(frame(os.path.join(ROOT, "frames", s["file"]), s["tag"], s["caption"], s.get("crop")))
         durations.append(int(s.get("seconds", 2.6) * 1000))
@@ -77,7 +84,7 @@ def main():
         pal_src.paste(f, (0, i * H))
     palette = pal_src.quantize(colors=128, method=Image.MEDIANCUT)
     gif = [f.quantize(palette=palette, dither=Image.NONE) for f in frames]
-    out = os.path.join(ROOT, "WordReader-making-of.gif")
+    out = os.path.join(ROOT, name)
     gif[0].save(out, save_all=True, append_images=gif[1:], duration=durations, loop=0, optimize=True)
     print(out, len(frames), "frames", os.path.getsize(out) // 1024, "KB")
 

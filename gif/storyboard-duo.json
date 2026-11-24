@@ -1,0 +1,92 @@
+[
+ {
+  "card": "WordReader 1.2",
+  "seconds": 4.0,
+  "footer": "github.com/LoetLuemmel/MacWordReader · all screenshots from the real PowerBook Duo 230",
+  "lines": [
+   "Today's Word (.docx) and OpenDocument (.odt) files, opened on a 1992 PowerBook Duo 230: 68030, 33 MHz, 8 MB, System 7.",
+   "Unzipped, parsed and drawn on the Mac itself, pictures included."
+  ]
+ },
+ {
+  "file": "duo/091505_02_wordreader_open.png",
+  "tag": "Word .docx",
+  "crop": [
+   0,
+   0,
+   580,
+   600
+  ],
+  "seconds": 4.0,
+  "caption": "A 2026 .docx: headings, lists, a table, umlauts, «», π Ω, recomposed accents, and stand-ins where Mac OS Roman has no letter."
+ },
+ {
+  "file": "duo/135814_06_euro.png",
+  "tag": "€",
+  "crop": [
+   0,
+   0,
+   580,
+   440
+  ],
+  "seconds": 3.5,
+  "caption": "System 7 has no € in Mac OS Roman or any bitmap font, so WordReader draws it with QuickDraw."
+ },
+ {
+  "file": "duo/160347_08_odt.png",
+  "tag": "OpenDocument",
+  "crop": [
+   0,
+   0,
+   580,
+   600
+  ],
+  "seconds": 4.0,
+  "caption": "An .odt from LibreOffice: centred and right-aligned text, bold, italic, underline, sizes, hanging indents, nested lists, a table."
+ },
+ {
+  "file": "duo/082700_docx_photo.png",
+  "tag": "Pictures",
+  "crop": [
+   0,
+   0,
+   580,
+   700
+  ],
+  "seconds": 4.5,
+  "caption": "New in 1.2: PNG and JPEG decoded on the Mac, shrunk while decoding and dithered to 16 greys. The photo is 1600 × 1000 pixels."
+ },
+ {
+  "file": "duo/084642_docx_clean.png",
+  "tag": "Speed",
+  "crop": [
+   0,
+   0,
+   830,
+   640
+  ],
+  "seconds": 4.0,
+  "caption": "Document Info: the text in 1.5 s, four pictures in 29.5 s, the photo in 15.7 s, all on a 33 MHz 68030 with no FPU."
+ },
+ {
+  "file": "duo/141644_07_copy.png",
+  "tag": "Copy",
+  "crop": [
+   0,
+   0,
+   580,
+   440
+  ],
+  "seconds": 3.5,
+  "caption": "Select and copy: Command-C puts plain Mac OS Roman text on the clipboard, ready for TeachText. Save as Text works too."
+ },
+ {
+  "card": "Download",
+  "seconds": 4.0,
+  "footer": "MIT licence · C89, built with MPW (SC 8.9)",
+  "lines": [
+   "github.com/LoetLuemmel/MacWordReader/releases",
+   "A 1.44 MB disk image with the app and demo documents, or the app alone as MacBinary. System 7, 1 MB of memory."
+  ]
+ }
+]
