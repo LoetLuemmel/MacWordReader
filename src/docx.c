@@ -14,7 +14,9 @@
  *   w:t           text run           -> the text, UTF-8 -> MacRoman
  *   w:tab w:br    in a run           -> tab, CR
  *   w:tc w:tr     table cell / row   -> tab, CR
- *   pic:pic       picture            -> "[Picture]"
+ *   w:drawing     picture            -> a DOCX_PIC item: a:blip's r:embed
+ *                                       through document.xml.rels, size from
+ *                                       wp:extent (v:imagedata likewise)
  *   mc:Fallback   duplicate content  -> skipped
  */
 #include "docx.h"
@@ -52,6 +54,9 @@ typedef struct {
     short  inT;             /* inside a text element */
     short  runDepth;
     short  skipDepth;       /* inside mc:Fallback */
+    short  inStyles;        /* reading styles.xml */
+    short  skipStyle;       /* styles.xml: inside a style nothing is read from */
+    short  auxDone;         /* the rest of this part is not needed: stop */
     short  tblDepth;
     short  inPara;
     short  paraStarted;     /* prefix written for this paragraph */
@@ -72,6 +77,15 @@ typedef struct {
     short  nLvl, nNum;
     struct { short abs, lvl, left, hang; } lvls[64];
     struct { short num, abs; } nums[64];
+
+    /* pictures: image relationships of the main part, the drawing being read */
+    short  zipped;          /* members can be read: emit DOCX_PIC items */
+    short  inRels;          /* reading document.xml.rels */
+    char   partDir[48];     /* "word/" - relationship targets are relative to it */
+    short  nRel;
+    struct { char id[16]; char target[DOCX_PIC_NAMEMAX + 1]; } rels[48];
+    short  inDrawing, picDone, sawPic;
+    long   picW, picH;      /* points */
 
     struct OdfCtx *odf;     /* set while reading OpenDocument */
 } Parser;
@@ -105,6 +119,7 @@ typedef struct OdfCtx {
     short  spanDepth;
     short  stackFace[8], stackSz[8];
     short  frameLevel;              /* skipDepth inside the current draw:frame */
+    long   frameW, frameH;          /* its size, points */
     short  space;                   /* last output was collapsible white space */
 } OdfCtx;
 
@@ -242,6 +257,98 @@ static void StartContent(Parser *p)
         }
     }
     ApplyRun(p);
+}
+
+/* A picture: a DOCX_PIC item for a member we can read, else "[Picture]". */
+static void EmitPicture(Parser *p, const char *member, long wPt, long hPt)
+{
+    short n = 0, i;
+    p->st->pictures++;
+    StartContent(p);
+    if (member && p->zipped)
+        while (member[n] > 0x20 && member[n] < 0x7F && n < DOCX_PIC_NAMEMAX)
+            n++;
+    if (n == 0 || member[n] != 0) {
+        EmitStr(p, "[Picture]");
+        return;
+    }
+    if (wPt < 0 || wPt > 4095) wPt = 0;
+    if (hPt < 0 || hPt > 4095) hPt = 0;
+    Emit(p, DOCX_PIC);
+    Emit(p, (wr_u8)(0x20 + (wPt >> 6)));
+    Emit(p, (wr_u8)(0x20 + (wPt & 63)));
+    Emit(p, (wr_u8)(0x20 + (hPt >> 6)));
+    Emit(p, (wr_u8)(0x20 + (hPt & 63)));
+    Emit(p, (wr_u8)(0x20 + n));
+    for (i = 0; i < n; i++)
+        Emit(p, (wr_u8)member[i]);
+    p->st->chars -= DOCX_PIC_HEAD + n;
+}
+
+/* The member a relationship id points at, or 0. */
+static const char *RelTarget(Parser *p, const char *id)
+{
+    short i;
+    for (i = 0; i < p->nRel; i++)
+        if (Eq(p->rels[i].id, id))
+            return p->rels[i].target;
+    return 0;
+}
+
+/* Record an image relationship; Target is relative to partDir ("../" allowed,
+   "%20" decoded), or absolute with a leading '/'. */
+static void AddRel(Parser *p)
+{
+    char id[16], type[120], target[DOCX_PIC_NAMEMAX + 1], mode[16], full[DOCX_PIC_NAMEMAX + 1];
+    short n, t, k, i;
+    if (p->nRel >= (short)(sizeof(p->rels) / sizeof(p->rels[0])))
+        return;
+    if (!AttrVal(p->tag, "Id", id, sizeof(id)) || !AttrVal(p->tag, "Type", type, sizeof(type)) ||
+        !AttrVal(p->tag, "Target", target, sizeof(target)))
+        return;
+    n = 0;
+    while (type[n])
+        n++;
+    if (n < 6 || !Eq(type + n - 6, "/image"))
+        return;
+    if (AttrVal(p->tag, "TargetMode", mode, sizeof(mode)) && Eq(mode, "External"))
+        return;
+    n = 0;
+    t = 0;
+    if (target[0] == '/')
+        t = 1;
+    else
+        while (p->partDir[n] && n < DOCX_PIC_NAMEMAX) {
+            full[n] = p->partDir[n];
+            n++;
+        }
+    while (target[t] && n < DOCX_PIC_NAMEMAX) {
+        if (target[t] == '.' && target[t + 1] == '.' && target[t + 2] == '/') {
+            if (n > 0) n--;                      /* drop "dir/" */
+            while (n > 0 && full[n - 1] != '/')
+                n--;
+            t += 3;
+        } else if (target[t] == '.' && target[t + 1] == '/') {
+            t += 2;
+        } else if (target[t] == '%' && target[t + 1] && target[t + 2]) {
+            short v = 0;
+            for (k = 1; k <= 2; k++) {
+                char c = target[t + k];
+                v = (short)(v * 16 + (c >= '0' && c <= '9' ? c - '0' : (c | 0x20) >= 'a' && (c | 0x20) <= 'f' ? (c | 0x20) - 'a' + 10 : 0));
+            }
+            full[n++] = (char)v;
+            t += 3;
+        } else {
+            full[n++] = target[t++];
+        }
+    }
+    full[n] = 0;
+    k = p->nRel++;
+    for (i = 0; id[i]; i++)
+        p->rels[k].id[i] = id[i];
+    p->rels[k].id[i] = 0;
+    for (i = 0; i <= n; i++)
+        p->rels[k].target[i] = full[i];
 }
 
 static void EmitCodePoint(Parser *p, wr_u32 cp)
@@ -453,7 +560,7 @@ static long AttrNum(const char *tag, const char *attr, long def)
     }
     if (v[i] < '0' || v[i] > '9')
         return def;
-    for (; v[i] >= '0' && v[i] <= '9'; i++)
+    for (; v[i] >= '0' && v[i] <= '9' && n < 100000000L; i++)
         n = n * 10 + (v[i] - '0');
     return neg ? -n : n;
 }
@@ -465,6 +572,15 @@ static short AttrOn(const char *tag)
     if (!AttrVal(tag, "val", v, sizeof(v)))
         return 1;
     return !(Eq(v, "0") || Eq(v, "false") || Eq(v, "off") || Eq(v, "none"));
+}
+
+static short StartsWith(const char *s, const char *key)
+{
+    while (*key && *s == *key) {
+        s++;
+        key++;
+    }
+    return *key == 0;
 }
 
 static short Contains(const char *s, const char *key)
@@ -496,14 +612,21 @@ static short HandleFormat(Parser *p, const char *name, short closing, short self
     if (Eq(name, "rPr")) { if (!selfClose) p->inRPr = (short)!closing; return 1; }
     if (Eq(name, "docDefaults")) { if (!selfClose) p->inDocDef = (short)!closing; return 1; }
     if (Eq(name, "style")) {
-        if (closing)
+        if (closing) {
+            if (p->inStyles && p->inDefStyle)
+                p->auxDone = 1;         /* docDefaults come first: all read */
             p->inDefStyle = 0;
+        }
         else if (!selfClose) {
             short para;
             AttrVal(p->tag, "type", v, sizeof(v));
             para = Eq(v, "paragraph");
             AttrVal(p->tag, "default", v, sizeof(v));
             p->inDefStyle = (short)(para && (Eq(v, "1") || Eq(v, "true") || Eq(v, "on")));
+            if (p->inStyles && !p->inDefStyle)
+                p->skipStyle = 1;       /* only the default paragraph style counts:
+                                           python-docx's styles.xml is 340 KB of
+                                           table styles, seconds on a 68030 */
         }
         return 1;
     }
@@ -616,7 +739,10 @@ static long OdfLen(const char *v)
     short i = 0, neg = 0;
     if (v[0] == '-') { neg = 1; i = 1; }
     for (; v[i] >= '0' && v[i] <= '9'; i++)
-        whole = whole * 10 + (v[i] - '0');
+        if (whole < 9999)
+            whole = whole * 10 + (v[i] - '0');
+    if (whole > 9999)
+        whole = 9999;                                   /* 9999 in: no overflow below */
     if (v[i] == '.')
         for (i++; v[i] >= '0' && v[i] <= '9'; i++)
             if (div < 10000) { frac = frac * 10 + (v[i] - '0'); div *= 10; }
@@ -628,7 +754,8 @@ static long OdfLen(const char *v)
     else if (v[i] == 'p' && v[i + 1] == 'c') f = 2400;
     else if (v[i] == 'p' && v[i + 1] == 'x') f = 150;
     else return 0;
-    num = num / 100 * f / 1000;
+    num /= 100;                                         /* value x 100, < 10^6 */
+    num = num / 100 * f / 10 + (num % 100) * f / 1000;
     return neg ? -num : num;
 }
 
@@ -816,18 +943,29 @@ static void OdfTag(Parser *p, const char *name, short closing, short selfClose)
     }
     if (Eq(name, "frame")) {
         OdfSkip(p, closing, selfClose);
-        if (!closing && !selfClose)
+        if (!closing && !selfClose) {
             o->frameLevel = p->skipDepth;
+            AttrVal(p->tag, "width", v, sizeof(v));
+            o->frameW = OdfLen(v) / 20;
+            AttrVal(p->tag, "height", v, sizeof(v));
+            o->frameH = OdfLen(v) / 20;
+        }
         return;
     }
     if (Eq(name, "image")) {
         if (!closing && p->skipDepth == o->frameLevel && p->skipDepth > 0 && p->inT) {
-            p->st->pictures++;
+            char href[DOCX_PIC_NAMEMAX + 1];
+            const char *m = 0;
+            /* Pictures/abc.png inside the package; not http:, not embedded */
+            if (AttrVal(p->tag, "href", href, sizeof(href)) && !Contains(href, ":")) {
+                m = href;
+                while (m[0] == '.' && m[1] == '/')
+                    m += 2;
+            }
             p->skipDepth = 0;            /* briefly: StartContent writes */
-            StartContent(p);
-            EmitStr(p, "[Picture]");
+            EmitPicture(p, m, o->frameW, o->frameH);
             p->skipDepth = o->frameLevel;
-            o->frameLevel = -1;          /* one marker per frame */
+            o->frameLevel = -1;          /* one picture per frame */
         }
         return;
     }
@@ -1001,6 +1139,71 @@ static void HandleTag(Parser *p)
     }
     if (p->skipDepth > 0)
         return;
+    if (p->skipStyle) {                 /* to the end of that style */
+        if (closing && Eq(name, p->skipStyle == 2 ? "latentStyles" : "style"))
+            p->skipStyle = 0;
+        return;
+    }
+    if (p->inStyles && !closing && !selfClose && Eq(name, "latentStyles")) {
+        p->skipStyle = 2;
+        return;
+    }
+    if (p->inRels) {
+        if (!closing && Eq(name, "Relationship"))
+            AddRel(p);
+        return;
+    }
+
+    /* pictures: w:drawing (wp:extent, a:blip) and VML (v:shape, v:imagedata) */
+    if (Eq(name, "drawing")) {
+        if (!closing) {
+            p->inDrawing = (short)!selfClose;
+            p->picDone = p->sawPic = 0;
+            p->picW = p->picH = 0;
+        } else {
+            if (p->inDrawing && !p->picDone && p->sawPic)
+                EmitPicture(p, 0, 0, 0);
+            p->inDrawing = 0;
+        }
+        return;
+    }
+    if (Eq(name, "extent") && p->inDrawing && !closing) {
+        p->picW = AttrNum(p->tag, "cx", 0) / 12700;        /* EMU -> points */
+        p->picH = AttrNum(p->tag, "cy", 0) / 12700;
+        return;
+    }
+    if (Eq(name, "blip") && !closing) {
+        if (AttrVal(p->tag, "embed", val, sizeof(val)) && p->inDrawing && !p->picDone) {
+            EmitPicture(p, RelTarget(p, val), p->picW, p->picH);
+            p->picDone = 1;
+        }
+        return;
+    }
+    if (Eq(name, "shape") && !closing) {             /* VML: style="width:120pt;height:80pt" */
+        char style[160];
+        p->picW = p->picH = 0;
+        if (AttrVal(p->tag, "style", style, sizeof(style))) {
+            short k;
+            for (k = 0; style[k]; k++) {
+                if (k > 0 && style[k - 1] != ';' && style[k - 1] != ' ')
+                    continue;
+                if (StartsWith(style + k, "width:"))
+                    p->picW = OdfLen(style + k + 6) / 20;
+                else if (StartsWith(style + k, "height:"))
+                    p->picH = OdfLen(style + k + 7) / 20;
+            }
+        }
+        return;
+    }
+    if (Eq(name, "imagedata") && !closing) {
+        if (!p->inDrawing) {
+            const char *m = 0;
+            if (AttrVal(p->tag, "id", val, sizeof(val)))
+                m = RelTarget(p, val);
+            EmitPicture(p, m, p->picW, p->picH);
+        }
+        return;
+    }
 
     if (closing && HandleFormat(p, name, closing, selfClose))
         return;
@@ -1082,10 +1285,10 @@ static void HandleTag(Parser *p)
                 p->st->lossy++;
             }
         }
-    } else if (Eq(name, "pic") || Eq(name, "imagedata")) {
-        p->st->pictures++;
-        StartContent(p);
-        EmitStr(p, "[Picture]");
+    } else if (Eq(name, "pic")) {
+        p->sawPic = 1;
+        if (!p->inDrawing)
+            EmitPicture(p, 0, 0, 0);
     } else if (Eq(name, "tbl")) {
         p->tblDepth++;
         p->st->tables++;
@@ -1163,8 +1366,37 @@ static long XmlFeed(void *ctx, const wr_u8 *buf, long n)
     Parser *p = (Parser *)ctx;
     long i;
     p->st->xmlBytes += (wr_u32)n;
-    for (i = 0; i < n && !p->stopped; i++) {
-        wr_u8 c = buf[i];
+    for (i = 0; i < n && !p->stopped && !p->auxDone; i++) {
+        wr_u8 c;
+        /* fast paths, in locals: markup outside text runs is skipped to the
+           next '<', and a tag's bytes are copied up to its '>' */
+        if (p->mode == M_TEXT && !p->inT && !p->inEnt) {
+            while (i < n && buf[i] != '<')
+                i++;
+            if (i >= n)
+                break;
+        } else if (p->mode == M_TAG && p->tagLen >= 9) {
+            char *t = p->tag, q = p->quote;
+            short tl = p->tagLen;
+            while (i < n) {
+                c = buf[i];
+                if (q) {
+                    if (c == (wr_u8)q)
+                        q = 0;
+                } else if (c == '"' || c == '\'') {
+                    q = (char)c;
+                } else if (c == '>')
+                    break;
+                if (tl < TAGMAX)
+                    t[tl++] = (char)c;
+                i++;
+            }
+            p->tagLen = tl;
+            p->quote = q;
+            if (i >= n)
+                break;
+        }
+        c = buf[i];
         switch (p->mode) {
         case M_TEXT:
             if (c == '<') {
@@ -1223,7 +1455,7 @@ static long XmlFeed(void *ctx, const wr_u8 *buf, long n)
             break;
         }
     }
-    return p->stopped;
+    return p->stopped || p->auxDone;
 }
 
 /* ---------- package handling ---------- */
@@ -1321,6 +1553,7 @@ static short ReadOdf(WrSource *src, Parser *p, DocxStats *st)
         return ZIP_ERR_MEM;
     p->odf->cur = p->odf->frameLevel = -1;
     p->defSz = 24;                      /* 12 pt, LibreOffice's default */
+    p->zipped = 1;
     if (zip_find(src, "styles.xml", &e) == ZIP_OK) {
         zip_extract(src, &e, XmlFeed, p);
         p->mode = M_TEXT;
@@ -1413,13 +1646,37 @@ short docx_convert(WrSource *src, WrWriteFn wr, void *wctx, DocxStats *st)
             err = zip_find(src, st->part, &e);
         }
         if (err == ZIP_OK) {
-            /* defaults and list indents first: same parser, no text in them */
+            /* defaults, list indents and picture relationships first: same
+               parser, no text in them */
             ZipEntry aux;
-            static const char *kAux[2] = { "word/styles.xml", "word/numbering.xml" };
-            short k;
-            for (k = 0; k < 2 && !p->stopped; k++)
+            char rels[DOCX_PIC_NAMEMAX + 16];
+            const char *kAux[3];
+            short k, slash = -1, j;
+            for (k = 0; st->part[k]; k++)
+                if (st->part[k] == '/')
+                    slash = k;
+            for (k = 0, j = 0; k <= slash && k < (short)sizeof(p->partDir) - 1; k++)
+                p->partDir[j++] = st->part[k];
+            p->partDir[j] = 0;
+            for (k = 0, j = 0; k <= slash && j < DOCX_PIC_NAMEMAX; k++)
+                rels[j++] = st->part[k];             /* word/_rels/document.xml.rels */
+            for (k = 0; "_rels/"[k]; k++)
+                rels[j++] = "_rels/"[k];
+            for (k = (short)(slash + 1); st->part[k] && j < DOCX_PIC_NAMEMAX + 8; k++)
+                rels[j++] = st->part[k];
+            for (k = 0; ".rels"[k]; k++)
+                rels[j++] = ".rels"[k];
+            rels[j] = 0;
+            kAux[0] = "word/styles.xml";
+            kAux[1] = "word/numbering.xml";
+            kAux[2] = rels;
+            p->zipped = 1;
+            for (k = 0; k < 3 && !p->stopped; k++)
                 if (zip_find(src, kAux[k], &aux) == ZIP_OK) {
+                    p->inRels = (short)(k == 2);
+                    p->inStyles = (short)(k == 0);
                     zip_extract(src, &aux, XmlFeed, p);
+                    p->inRels = p->inStyles = p->skipStyle = p->auxDone = 0;
                     p->mode = M_TEXT;
                     p->inT = 0;
                     p->inDocDef = p->inDefStyle = p->inPPr = p->inRPr = 0;
@@ -1488,9 +1745,37 @@ short docx_convert(WrSource *src, WrWriteFn wr, void *wctx, DocxStats *st)
 long docx_ctrl_len(const wr_u8 *t, long i, long len)
 {
     wr_u8 c = t[i];
+    long n;
     if (DOCX_IS_MARKER(c) || DOCX_IS_FACE(c) || DOCX_IS_SIZE(c))
         return 1;
     if (c == DOCX_PARA)
         return (i + DOCX_PARA_LEN <= len) ? DOCX_PARA_LEN : len - i;
+    if (c == DOCX_PIC) {
+        if (i + DOCX_PIC_HEAD > len)
+            return len - i;
+        n = DOCX_PIC_HEAD + (long)(t[i + 5] - 0x20);
+        return (n >= DOCX_PIC_HEAD && i + n <= len) ? n : len - i;
+    }
     return 0;
+}
+
+short docx_pic_info(const wr_u8 *t, long i, long len, short *wPt, short *hPt, char *name)
+{
+    short n, k;
+    *wPt = *hPt = 0;
+    name[0] = 0;
+    if (t[i] != DOCX_PIC || i + DOCX_PIC_HEAD > len)
+        return 0;
+    for (k = 1; k < DOCX_PIC_HEAD - 1; k++)
+        if (t[i + k] < 0x20 || t[i + k] > 0x5F)
+            return 0;
+    n = (short)(t[i + 5] - 0x20);
+    if (n < 1 || n > DOCX_PIC_NAMEMAX || i + DOCX_PIC_HEAD + n > len)
+        return 0;
+    *wPt = (short)(((t[i + 1] - 0x20) << 6) | (t[i + 2] - 0x20));
+    *hPt = (short)(((t[i + 3] - 0x20) << 6) | (t[i + 4] - 0x20));
+    for (k = 0; k < n; k++)
+        name[k] = (char)t[i + DOCX_PIC_HEAD + k];
+    name[n] = 0;
+    return 1;
 }

@@ -7,9 +7,9 @@
 #include "icons.r"
 
 resource 'vers' (1) {
-    0x01, 0x10, release, 0x00, verGermany,
-    "1.1",
-    "1.1, Word (.docx) and OpenDocument (.odt) reader for 68k Macs"
+    0x01, 0x20, release, 0x00, verGermany,
+    "1.2",
+    "1.2, Word (.docx) and OpenDocument (.odt) reader with pictures, for 68k Macs"
 };
 
 resource 'SIZE' (-1) {
@@ -18,7 +18,7 @@ resource 'SIZE' (-1) {
     ignoreChildDiedEvents, is32BitCompatible, isHighLevelEventAware,
     onlyLocalHLEvents, notStationeryAware, dontUseTextEditServices,
     reserved, reserved, reserved,
-    768 * 1024,      /* preferred (raise in Get Info for book-length documents) */
+    1024 * 1024,     /* preferred: pictures stay decoded (raise for book-length documents) */
     384 * 1024       /* minimum: an 8 MB Duo running the bridge has little to spare */
 };
 
@@ -86,11 +86,11 @@ resource 'ALRT' (129, "About") {
 resource 'DITL' (129) {
     {
         {148, 338, 168, 406}, Button { enabled, "OK" };
-        {10, 60, 28, 410},    StaticText { disabled, "WordReader 1.1" };
+        {10, 60, 28, 410},    StaticText { disabled, "WordReader 1.2" };
         {32, 60, 140, 410},   StaticText { disabled,
             "Reads Word (.docx, .docm, .dotx, Word XML) and OpenDocument (.odt, .fodt) "
-            "on a 68k Mac, with spacing, indents, bold and italic. Unicode becomes "
-            "Mac OS Roman; what it lacks is spelt out or shown as ?." }
+            "on a 68k Mac, with spacing, indents, bold and italic, and PNG and JPEG "
+            "pictures in 16 greys. Unicode becomes Mac OS Roman." }
     }
 };
 

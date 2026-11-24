@@ -221,16 +221,51 @@ static short StoredBlock(State *s)
     return s->err;
 }
 
+/* The hot loop. Bit buffer, bit count and window position live in locals
+   (registers on the 68k); the State is updated only around the slow paths.
+   A literal with a short code costs one table read and one store. */
+#define SYNC() (s->bitbuf = bb, s->bitcnt = bc, s->total += (wr_u32)(wp - wp0), s->wpos = wp, wp0 = wp)
+#define LOAD() (bb = s->bitbuf, bc = s->bitcnt, wp = wp0 = s->wpos)
+
 static short Codes(State *s, Huff *lit, Huff *dist)
 {
-    short sym;
-    long len, d;
+    wr_u32 bb;
+    short bc, sym;
+    long wp, wp0, len, d, from;
+    unsigned short e;
+    wr_u8 *win = s->win;
+    const unsigned short *lfast = lit->fast;
 
+    LOAD();
     for (;;) {
-        if (s->err != INF_OK)
-            return s->err;
-        if (s->overrun > 4)
-            return INF_ERR_DATA;
+        if (s->err != INF_OK || s->overrun > 4) {
+            SYNC();
+            return s->err != INF_OK ? s->err : INF_ERR_DATA;
+        }
+        /* at least 9 bits: from the input buffer directly while it lasts */
+        while (bc < FASTBITS) {
+            if (s->inPos < s->inLen)
+                bb |= (wr_u32)s->in[s->inPos++] << bc;
+            else {
+                SYNC();
+                bb |= (wr_u32)NextByte(s) << bc;
+            }
+            bc += 8;
+        }
+        e = lfast[bb & ((1 << FASTBITS) - 1)];
+        if (e != 0 && (e & 0x0FFF) < 256) {     /* a literal */
+            bb >>= (e >> 12);
+            bc -= (short)(e >> 12);
+            win[wp++] = (wr_u8)e;
+            if (wp == WSIZE) {
+                SYNC();
+                Flush(s);
+                s->wpos = s->flushed = 0;
+                LOAD();
+            }
+            continue;
+        }
+        SYNC();
         sym = Decode(s, lit);
         if (sym < 0)
             return INF_ERR_DATA;
@@ -249,9 +284,19 @@ static short Codes(State *s, Huff *lit, Huff *dist)
             d = kDistBase[sym] + (long)Bits(s, kDistExtra[sym]);
             if ((wr_u32)d > s->total)
                 return INF_ERR_DATA;
-            while (len-- > 0)
-                Put(s, s->win[(s->wpos - d) & WMASK]);
+            /* the copy: straight through the window unless it wraps */
+            from = s->wpos - d;
+            if (from >= 0 && s->wpos + len < WSIZE) {
+                wr_u8 *o = win + s->wpos, *f = win + from;
+                s->wpos += len;
+                s->total += (wr_u32)len;
+                while (len-- > 0)
+                    *o++ = *f++;
+            } else
+                while (len-- > 0)
+                    Put(s, win[(s->wpos - d) & WMASK]);
         }
+        LOAD();
     }
 }
 

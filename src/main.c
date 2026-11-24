@@ -9,6 +9,11 @@
  *
  * The window draws its own text rather than using TextEdit: TextEdit stops
  * at 32 KB, a long Word document does not.
+ *
+ * Pictures (PNG, JPEG) are decoded when they first scroll into view, at the
+ * size they are shown, into 16 grey levels (1 bit on a Mac without Color
+ * QuickDraw), and kept in purgeable handles: when memory runs short the
+ * Memory Manager takes them back, and they are decoded again when needed.
  */
 #include <Types.h>
 #include <MacMemory.h>
@@ -35,9 +40,11 @@
 #include <Scrap.h>
 #include <Sound.h>
 #include <LowMem.h>
+#include <Folders.h>
 
 #include "docx.h"
 #include "zipdir.h"
+#include "image.h"
 
 QDGlobals qd;
 
@@ -73,7 +80,7 @@ QDGlobals qd;
 #define iCopy         4
 #define iPaste        5
 #define iClear        6
-#define iSelectAll    7
+#define iSelectAll    8
 #define rAlertError   128
 #define rAlertAbout   129
 #define rAlertInfo    130
@@ -94,7 +101,21 @@ typedef struct {
     short         shift;     /* centring / right alignment */
     short         asc;       /* line top to baseline, space before included */
     short         height;    /* whole line, space before and after included */
+    short         pw, ph;    /* a picture line: the picture's size (pw > 0) */
 } LineRec;
+
+/* A decoded picture, kept for redrawing. */
+#define kMaxPics  16
+enum { kPicNone = 0, kPicReady, kPicFailed };
+typedef struct {
+    long   off;              /* its DOCX_PIC item in the text */
+    short  w, h;             /* shown size, pixels */
+    short  rowBytes;
+    short  state;
+    Handle bits;             /* purgeable: 4-bit grey, or 1-bit */
+    long   used;             /* TickCount when last drawn */
+    char   why[48];          /* not drawn: what the box says */
+} PicEntry;
 
 typedef struct {
     Handle        text;      /* MacRoman, CR-separated, with style markers */
@@ -112,6 +133,9 @@ typedef struct {
     long          selStart;  /* selection: text offsets, selStart <= selEnd */
     long          selEnd;
     Boolean       active;    /* front and not suspended: show the selection */
+    PicEntry      pics[kMaxPics];
+    long          picCount;  /* pictures decoded so far, their total and slowest time */
+    long          picTicks, picSlowest;
 } DocRec, *DocPtr;
 
 /* metrics of one face and size of Geneva */
@@ -193,6 +217,9 @@ static short gBaseSize = 12;
 static short gQuit = 0;
 static long  gLastYield = 0;
 static Boolean gHasAE = false;
+static Boolean gHasCQD = false;       /* Color QuickDraw: pictures in 16 greys */
+static CTabHandle gGreyCT = 0;
+static unsigned char gDither[16][256];  /* Bayer level, grey -> colour index */
 static ControlActionUPP gScrollUPP;
 
 /* ------------------------------------------------------------------ util */
@@ -522,6 +549,31 @@ static short WalkStep(Walker *w, unsigned char c, short left)
     return cw;
 }
 
+/* A picture's size on screen: its size in points (1 point = 1 pixel),
+   shrunk to fit the column and the window. */
+static void PicSize(const unsigned char *t, long i, long end, short maxW, short maxH,
+                    short *pw, short *ph)
+{
+    char name[DOCX_PIC_NAMEMAX + 1];
+    short w, h;
+    if (!docx_pic_info(t, i, end, &w, &h, name) || w <= 0 || h <= 0) {
+        w = 160;                                /* size unknown */
+        h = 120;
+    }
+    if (maxW < 8)
+        maxW = 8;
+    if (w > maxW) {
+        h = (short)((long)h * maxW / w);
+        w = maxW;
+    }
+    if (h > maxH) {
+        w = (short)((long)w * maxH / h);
+        h = maxH;
+    }
+    *pw = (short)(w < 8 ? 8 : w);
+    *ph = (short)(h < 8 ? 8 : h);
+}
+
 static Boolean AddLine(DocPtr d, const LineRec *src)
 {
     if (d->nLines >= d->linesCap) {
@@ -539,7 +591,7 @@ static void Layout(WindowPtr w)
 {
     DocPtr d = DocOf(w);
     Rect r;
-    short maxW, left, x0;
+    short maxW, maxH, left, x0;
     long i, p, end, lineStart, lineEnd, next, lastBreak, k;
     unsigned char *t;
     long h, avail;
@@ -555,6 +607,9 @@ static void Layout(WindowPtr w)
     maxW = (short)(r.right - r.left - 2 * kMargin);
     if (maxW < 40)
         maxW = 40;
+    maxH = (short)(r.bottom - r.top - kMargin - 8);   /* a picture fits the window */
+    if (maxH < 40)
+        maxH = 40;
     d->nLines = 0;
 
     HLock(d->text);
@@ -583,7 +638,7 @@ static void Layout(WindowPtr w)
             for (i = lineStart; i < end && i - lineStart < 2000; i++) {
                 unsigned char c = t[i];
                 short cw;
-                if (c == DOCX_CH_LINEBREAK)
+                if (c == DOCX_CH_LINEBREAK || c == DOCX_PIC)
                     break;
                 cw = WalkStep(&wk, c, left);
                 if (cw > 0 && wk.x > maxW && placed)
@@ -593,9 +648,38 @@ static void Layout(WindowPtr w)
                 if (c == ' ' || c == '-' || c == '\t')
                     lastBreak = i + 1;
             }
+            if (i < end && t[i] == DOCX_PIC && !placed) {
+                /* a picture: a line of its own, aligned like its paragraph */
+                lr.start = i;
+                lr.len = (short)docx_ctrl_len(t, i, end);
+                next = i + lr.len;
+                st = wk.s;                      /* run changes just before it */
+                lr.face = st.face;
+                lr.step = st.step;
+                lr.x0 = x0;
+                lr.left = left;
+                PicSize(t, i, end, (short)(maxW - x0), maxH, &lr.pw, &lr.ph);
+                lr.shift = 0;
+                if (pi.align == DOCX_AL_CENTER)
+                    lr.shift = (short)((maxW - x0 - lr.pw) / 2);
+                else if (pi.align == DOCX_AL_RIGHT)
+                    lr.shift = (short)(maxW - x0 - lr.pw);
+                if (lr.shift < 0)
+                    lr.shift = 0;
+                lr.asc = (short)((first ? pi.before : 0) + 4);
+                lr.height = (short)(lr.asc + lr.ph + 4 + (next >= end ? pi.after : 0));
+                if (!AddLine(d, &lr))
+                    goto done;
+                lineStart = next;
+                x0 = left;
+                first = false;
+                continue;
+            }
             if (i < end && t[i] == DOCX_CH_LINEBREAK) {
                 lineEnd = i;
                 next = i + 1;
+            } else if (i < end && t[i] == DOCX_PIC) {
+                lineEnd = next = i;             /* text before a picture ends here */
             } else if (i >= end) {
                 lineEnd = next = end;
             } else {
@@ -610,6 +694,7 @@ static void Layout(WindowPtr w)
             lr.x0 = x0;
             lr.left = left;
             lr.shift = 0;
+            lr.pw = lr.ph = 0;
             WalkStart(&wk, &lr);
             {
                 short asc = wk.m->ascent, desc = (short)(wk.m->height - wk.m->ascent);
@@ -671,6 +756,8 @@ static short LineX(const unsigned char *t, const LineRec *lr, long pos)
 {
     Walker wk;
     long k;
+    if (lr->pw > 0)
+        return (short)(lr->x0 + (pos > lr->start ? lr->pw : 0));
     WalkStart(&wk, lr);
     for (k = lr->start; k < pos && k < lr->start + lr->len; k++)
         WalkStep(&wk, t[k], lr->left);
@@ -682,6 +769,8 @@ static long LinePos(const unsigned char *t, const LineRec *lr, short hx)
 {
     Walker wk;
     long k;
+    if (lr->pw > 0)
+        return hx < lr->x0 + lr->pw / 2 ? lr->start : lr->start + lr->len;
     WalkStart(&wk, lr);
     for (k = lr->start; k < lr->start + lr->len; k++) {
         short x = wk.x, cw = WalkStep(&wk, t[k], lr->left);
@@ -689,6 +778,321 @@ static long LinePos(const unsigned char *t, const LineRec *lr, short hx)
             return k;
     }
     return lr->start + lr->len;
+}
+
+/* ------------------------------------------------------------- pictures */
+
+typedef struct {
+    short refNum;
+} FileCtx;
+
+static long FileReadAt(void *ctx, wr_u32 off, wr_u8 *buf, long n)
+{
+    FileCtx *f = (FileCtx *)ctx;
+    long count = n;
+    OSErr err;
+    if (SetFPos(f->refNum, fsFromStart, (long)off) != noErr)
+        return -1;
+    err = FSRead(f->refNum, &count, buf);
+    if (err != noErr && err != eofErr)
+        return -1;
+    return count;
+}
+
+/* a stored (uncompressed) member, read in place */
+typedef struct {
+    WrSource *base;
+    wr_u32    off;
+} SubCtx;
+
+static long SubReadAt(void *ctx, wr_u32 off, wr_u8 *buf, long n)
+{
+    SubCtx *s = (SubCtx *)ctx;
+    return s->base->readAt(s->base->ctx, s->off + off, buf, n);
+}
+
+/* a compressed member goes to a file in Temporary Items first: the picture
+   decoders read their input at will, the inflater only streams forward */
+static long TempWrite(void *ctx, const wr_u8 *b, long n)
+{
+    long count = n;
+    return FSWrite(*(short *)ctx, &count, b) == noErr ? 0 : 1;
+}
+
+static OSErr OpenTemp(FSSpec *tmp, short *ref)
+{
+    short vRef;
+    long dir;
+    OSErr err = FindFolder(kOnSystemDisk, kTemporaryFolderType, kCreateFolder, &vRef, &dir);
+    if (err != noErr)
+        return err;
+    err = FSMakeFSSpec(vRef, dir, "\pWordReader picture", tmp);
+    if (err != noErr && err != fnfErr)
+        return err;
+    FSpDelete(tmp);
+    err = FSpCreate(tmp, kCreator, 'TEMP', smSystemScript);
+    if (err != noErr)
+        return err;
+    return FSpOpenDF(tmp, fsRdWrPerm, ref);
+}
+
+/* rows from the decoder, ordered-dithered into 16 greys (index 0 = white)
+   or into black and white */
+typedef struct {
+    unsigned char *base;
+    short rowBytes;
+    long  rows;
+} PicSink;
+
+static const unsigned char kBayer[4][4] = {
+    { 0, 8, 2, 10 }, { 12, 4, 14, 6 }, { 3, 11, 1, 9 }, { 15, 7, 13, 5 }
+};
+
+static long PicRow(void *ctx, short y, const wr_u8 *g, short w)
+{
+    PicSink *s = (PicSink *)ctx;
+    unsigned char *row = s->base + (long)y * s->rowBytes;
+    const unsigned char *bay = kBayer[y & 3];
+    short x;
+    if (gHasCQD) {
+        const unsigned char *d0 = gDither[bay[0]], *d1 = gDither[bay[1]];
+        const unsigned char *d2 = gDither[bay[2]], *d3 = gDither[bay[3]];
+        for (x = 0; x + 3 < w; x += 4) {        /* two bytes, four pixels */
+            row[x >> 1] = (unsigned char)((d0[g[x]] << 4) | d1[g[x + 1]]);
+            row[(x >> 1) + 1] = (unsigned char)((d2[g[x + 2]] << 4) | d3[g[x + 3]]);
+        }
+        for (; x < w; x++) {
+            short idx = gDither[bay[x & 3]][g[x]];
+            row[x >> 1] |= (unsigned char)((x & 1) ? idx : idx << 4);
+        }
+    } else {
+        for (x = 0; x < w; x++)
+            if (g[x] < bay[x & 3] * 16 + 8)
+                row[x >> 3] |= (unsigned char)(0x80 >> (x & 7));
+    }
+    s->rows++;
+    Breathe();
+    return 0;
+}
+
+static void SetWhy(PicEntry *e, const char *a, const char *b)
+{
+    short n = 0;
+    e->state = kPicFailed;
+    while (*a && n < (short)sizeof(e->why) - 1)
+        e->why[n++] = *a++;
+    while (b && *b && n < (short)sizeof(e->why) - 1)
+        e->why[n++] = *b++;
+    e->why[n] = 0;
+}
+
+/* Decode the picture of line lr into e (e->w x e->h). */
+static void DecodePicture(DocPtr d, const unsigned char *t, const LineRec *lr, PicEntry *e)
+{
+    char name[DOCX_PIC_NAMEMAX + 1];
+    short wPt, hPt, err, tref = 0;
+    FileCtx fc, tc;
+    WrSource src, pic;
+    SubCtx sub;
+    ZipEntry ze;
+    ImgInfo info;
+    PicSink ps;
+    FSSpec tmp;
+    long eof;
+
+    if (!docx_pic_info(t, lr->start, lr->start + lr->len, &wPt, &hPt, name)) {
+        SetWhy(e, "Picture", 0);
+        return;
+    }
+    if (FSpOpenDF(&d->spec, fsRdPerm, &fc.refNum) != noErr) {
+        SetWhy(e, "Picture: the document is gone", 0);
+        return;
+    }
+    SetCursor(*GetCursor(watchCursor));
+    GetEOF(fc.refNum, &eof);
+    src.readAt = FileReadAt;
+    src.ctx = &fc;
+    src.size = (wr_u32)eof;
+    pic = src;
+    err = zip_find(&src, name, &ze);
+    if (err != ZIP_OK) {
+        SetWhy(e, "Picture missing: ", name);
+    } else if (ze.method == 0) {
+        sub.base = &src;
+        sub.off = ze.dataOff;
+        pic.readAt = SubReadAt;
+        pic.ctx = &sub;
+        pic.size = ze.size;
+    } else {
+        if (OpenTemp(&tmp, &tc.refNum) != noErr) {
+            err = ZIP_ERR_READ;
+            SetWhy(e, "Picture: no temporary file", 0);
+        } else {
+            tref = tc.refNum;
+            err = zip_extract(&src, &ze, TempWrite, &tc.refNum);
+            pic.readAt = FileReadAt;
+            pic.ctx = &tc;
+            pic.size = ze.size;
+            if (err != ZIP_OK)
+                SetWhy(e, err == ZIP_ERR_STOPPED ? "Picture: disk full" : "Picture: damaged", 0);
+        }
+    }
+    if (err == ZIP_OK && img_probe(&pic, &info) == IMG_OK &&
+        info.type != IMG_PNG && info.type != IMG_JPEG) {
+        SetWhy(e, "Picture: ", img_type_name(info.type));
+        err = IMG_ERR_FORMAT;
+    }
+    if (err == ZIP_OK) {
+        e->rowBytes = (short)(gHasCQD ? ((e->w * 4L + 15) / 16) * 2 : ((e->w + 15L) / 16) * 2);
+        e->bits = NewHandleClear((long)e->rowBytes * e->h);
+        if (e->bits == 0) {
+            SetWhy(e, "Picture: not enough memory", 0);
+        } else {
+            long t0 = TickCount();
+            HLock(e->bits);
+            ps.base = (unsigned char *)*e->bits;
+            ps.rowBytes = e->rowBytes;
+            ps.rows = 0;
+            err = img_decode(&pic, e->w, e->h, PicRow, &ps);
+            HUnlock(e->bits);
+            t0 = TickCount() - t0;
+            d->picCount++;
+            d->picTicks += t0;
+            if (t0 > d->picSlowest)
+                d->picSlowest = t0;
+            if (err == IMG_OK || (err == IMG_ERR_DATA && ps.rows > 0)) {
+                e->state = kPicReady;
+                HPurge(e->bits);                /* the Memory Manager may take it back */
+            } else {
+                DisposeHandle(e->bits);
+                e->bits = 0;
+                SetWhy(e, err == IMG_ERR_MEM ? "Picture: not enough memory" :
+                          err == IMG_ERR_SIZE ? "Picture: too large" :
+                          err == IMG_ERR_FORMAT ? "Picture: this kind of JPEG (CMYK?)" :
+                          "Picture: damaged", 0);
+            }
+        }
+    }
+    if (tref) {
+        FSClose(tref);
+        FSpDelete(&tmp);
+    }
+    FSClose(fc.refNum);
+}
+
+/* The cache entry for the picture at text offset off, shown w x h. */
+static PicEntry *FindPic(DocPtr d, long off, short w, short h)
+{
+    PicEntry *e = 0;
+    short i;
+    for (i = 0; i < kMaxPics; i++)
+        if (d->pics[i].state != kPicNone && d->pics[i].off == off) {
+            e = &d->pics[i];
+            break;
+        }
+    if (e == 0) {                               /* a free slot, or the least recently drawn */
+        e = &d->pics[0];
+        for (i = 0; i < kMaxPics; i++) {
+            if (d->pics[i].state == kPicNone) {
+                e = &d->pics[i];
+                break;
+            }
+            if (d->pics[i].used < e->used)
+                e = &d->pics[i];
+        }
+    }
+    if (e->state == kPicNone || e->off != off || e->w != w || e->h != h ||
+        (e->state == kPicReady && (e->bits == 0 || *e->bits == 0))) {
+        if (e->bits)
+            DisposeHandle(e->bits);
+        e->bits = 0;
+        e->off = off;
+        e->w = w;
+        e->h = h;
+        e->state = kPicNone;
+        e->why[0] = 0;
+    }
+    return e;
+}
+
+static void PicFrame(const Rect *box, const char *why)
+{
+    short n = 0;
+    PenPat(&qd.gray);
+    FrameRect(box);
+    PenNormal();
+    while (why[n])
+        n++;
+    if (box->bottom - box->top >= 16 && box->right - box->left >= 40) {
+        RgnHandle save = NewRgn();
+        Rect in = *box;
+        GetClip(save);
+        InsetRect(&in, 2, 2);
+        ClipRect(&in);                          /* intersected again below */
+        SectRgn(save, qd.thePort->clipRgn, qd.thePort->clipRgn);
+        TextFont(applFont);
+        TextFace(0);
+        TextSize(9);
+        MoveTo((short)(box->left + 5), (short)(box->top + 13));
+        DrawText((Ptr)why, 0, n);
+        SetClip(save);
+        DisposeRgn(save);
+    }
+}
+
+static void DrawPic(DocPtr d, const unsigned char *t, const LineRec *lr, const Rect *box)
+{
+    PicEntry *e = FindPic(d, lr->start, lr->pw, lr->ph);
+    Rect src;
+    if (e->state == kPicNone) {
+        PicFrame(box, "");
+        DecodePicture(d, t, lr, e);
+    }
+    e->used = TickCount();
+    if (e->state != kPicReady) {
+        EraseRect(box);
+        PicFrame(box, e->why);
+        return;
+    }
+    SetRect(&src, 0, 0, e->w, e->h);
+    HLock(e->bits);
+    if (gHasCQD) {
+        PixMap pm;
+        char *z = (char *)&pm;
+        short i;
+        GDHandle gd = GetMainDevice();
+        for (i = 0; i < (short)sizeof(pm); i++)  /* the tail differs between header versions */
+            z[i] = 0;
+        pm.baseAddr = *e->bits;
+        pm.rowBytes = (short)(e->rowBytes | 0x8000);
+        pm.bounds = src;
+        pm.hRes = pm.vRes = 0x00480000;
+        pm.pixelSize = 4;
+        pm.cmpCount = 1;
+        pm.cmpSize = 4;
+        pm.pmTable = gGreyCT;
+        ForeColor(blackColor);
+        BackColor(whiteColor);
+        CopyBits((BitMap *)&pm, &qd.thePort->portBits, &src, box,
+                 (short)((**(**gd).gdPMap).pixelSize >= 4 ? srcCopy : ditherCopy), 0);
+    } else {
+        BitMap bm;
+        bm.baseAddr = *e->bits;
+        bm.rowBytes = e->rowBytes;
+        bm.bounds = src;
+        CopyBits(&bm, &qd.thePort->portBits, &src, box, srcCopy, 0);
+    }
+    HUnlock(e->bits);
+}
+
+static void FreePictures(DocPtr d)
+{
+    short i;
+    for (i = 0; i < kMaxPics; i++)
+        if (d->pics[i].bits) {
+            DisposeHandle(d->pics[i].bits);
+            d->pics[i].bits = 0;
+        }
 }
 
 /* Draw line i whose top is at top; erase first if asked. The selection is
@@ -708,6 +1112,17 @@ static void DrawLine(DocPtr d, const unsigned char *t, long i, short top,
     SetRect(&lineR, r->left, top, r->right, (short)(top + lr->height));
     if (erase)
         EraseRect(&lineR);
+    if (lr->pw > 0) {
+        Rect box;
+        box.left = (short)(org + lr->x0);
+        box.top = (short)(top + lr->asc);
+        box.right = (short)(box.left + lr->pw);
+        box.bottom = (short)(box.top + lr->ph);
+        DrawPic(d, t, lr, &box);
+        if (d->active && d->selStart < b && d->selEnd > a)
+            InvertRect(&box);       /* plain: highlight mode would only swap white */
+        return;
+    }
     WalkStart(&wk, lr);
     UseFont(wk.m);
     MoveTo((short)(org + wk.x), base);
@@ -834,12 +1249,26 @@ static void ScrollTo(WindowPtr w, long top)
     DrawDoc(w);
 }
 
-static long PageLines(WindowPtr w)
+/* Lines that fit in the window going down (dir > 0) or up from the top
+   line, one text line of overlap kept. */
+static long PageLines(WindowPtr w, short dir)
 {
+    DocPtr d = DocOf(w);
     Rect r;
-    long n;
+    long i, n = 0, h = 0, avail;
+    LineRec *lr;
+    if (d == 0)
+        return 1;
     ContentRect(w, &r);
-    n = (r.bottom - r.top) / GetM(0, gBodyIdx)->height - 1;
+    avail = r.bottom - r.top - kMargin - GetM(0, gBodyIdx)->height;
+    lr = (LineRec *)*d->lines;
+    if (dir > 0) {
+        for (i = d->top; i < d->nLines && (h += lr[i].height) <= avail; i++)
+            n++;
+    } else {
+        for (i = d->top - 1; i >= 0 && (h += lr[i].height) <= avail; i--)
+            n++;
+    }
     return n < 1 ? 1 : n;
 }
 
@@ -853,8 +1282,8 @@ static pascal void ScrollAction(ControlHandle c, short part)
     switch (part) {
     case kPartUp:   delta = -1; break;
     case kPartDown: delta = 1; break;
-    case kPartPageUp:     delta = -PageLines(w); break;
-    case kPartPageDown:   delta = PageLines(w); break;
+    case kPartPageUp:     delta = -PageLines(w, -1); break;
+    case kPartPageDown:   delta = PageLines(w, 1); break;
     default: return;
     }
     ScrollTo(w, d->top + delta);
@@ -888,7 +1317,7 @@ static long PointToPos(WindowPtr w, Point pt)
     }
     HLock(d->text);
     lr = (LineRec *)*d->lines + i;
-    pos = LinePos((unsigned char *)*d->text, lr, (short)(pt.h - r.left - kMargin));
+    pos = LinePos((unsigned char *)*d->text, lr, (short)(pt.h - r.left - kMargin - lr->shift));
     HUnlock(d->text);
     return pos;
 }
@@ -900,6 +1329,14 @@ static short PlainBytes(const unsigned char *t, long len, long *i, unsigned char
 {
     unsigned char c = t[*i];
     long skip = docx_ctrl_len(t, *i, len);
+    if (c == DOCX_PIC) {
+        static const char kPic[] = "[Picture]";
+        short k;
+        *i += skip;
+        for (k = 0; out && k < 9; k++)
+            out[k] = (unsigned char)kPic[k];
+        return 9;
+    }
     if (skip) {
         *i += skip;
         return 0;
@@ -930,19 +1367,35 @@ static Boolean IsWordChar(unsigned char c)
 static void WordAt(DocPtr d, long pos, long *a, long *b)
 {
     unsigned char *t = (unsigned char *)*d->text;
-    long ps, cs;
+    long ps, i, ws = -1;
     ParaInfo pi;
     *a = *b = pos;
-    while (*a > 0 && IsWordChar(t[*a - 1]))
-        (*a)--;
-    while (*b < d->len && IsWordChar(t[*b]))
-        (*b)++;
-    /* not into the paragraph's prefix (its record bytes look like text) */
+    /* walk the paragraph from its first text byte: records and picture
+       names look like text, run changes may sit inside a word */
     for (ps = pos; ps > 0 && t[ps - 1] != '\r'; ps--)
         ;
-    cs = ParsePara(t, ps, d->len, &pi);
-    if (*a < cs)
-        *a = cs;
+    i = ParsePara(t, ps, d->len, &pi);
+    while (i < d->len && t[i] != '\r') {
+        long cl = docx_ctrl_len(t, i, d->len);
+        if (cl && t[i] != DOCX_PIC) {
+            i += cl;
+            continue;
+        }
+        if (cl == 0 && IsWordChar(t[i])) {
+            if (ws < 0)
+                ws = i;
+            i++;
+            continue;
+        }
+        if (i >= pos)
+            break;
+        ws = -1;
+        i += cl ? cl : 1;
+    }
+    if (ws >= 0 && ws <= pos) {
+        *a = ws;
+        *b = i;
+    }
 }
 
 /* Change the selection, redrawing only the lines whose highlight changes. */
@@ -1065,23 +1518,6 @@ static void AdjustCursor(Point where)
 
 /* ------------------------------------------------------------ documents */
 
-typedef struct {
-    short refNum;
-} FileCtx;
-
-static long FileReadAt(void *ctx, wr_u32 off, wr_u8 *buf, long n)
-{
-    FileCtx *f = (FileCtx *)ctx;
-    long count = n;
-    OSErr err;
-    if (SetFPos(f->refNum, fsFromStart, (long)off) != noErr)
-        return -1;
-    err = FSRead(f->refNum, &count, buf);
-    if (err != noErr && err != eofErr)
-        return -1;
-    return count;
-}
-
 /* the sink: append to the document's text handle */
 static long TextAppend(void *ctx, const wr_u8 *buf, long n)
 {
@@ -1194,7 +1630,10 @@ static void OpenDocFile(FSSpec *spec)
     SizeToScreen(&r);
     OffsetRect(&r, (short)(stagger * 12), (short)(stagger * 12));
     stagger = (short)((stagger + 1) % 5);
-    w = NewWindow(0, &r, spec->name, false, zoomDocProc, (WindowPtr)-1L, true, (long)d);
+    if (gHasCQD)
+        w = NewCWindow(0, &r, spec->name, false, zoomDocProc, (WindowPtr)-1L, true, (long)d);
+    else
+        w = NewWindow(0, &r, spec->name, false, zoomDocProc, (WindowPtr)-1L, true, (long)d);
     if (w == 0) {
         DisposeHandle(d->text);
         DisposeHandle(d->lines);
@@ -1233,6 +1672,7 @@ static void CloseDoc(WindowPtr w)
         return;
     }
     DisposeWindow(w);
+    FreePictures(d);
     DisposeHandle(d->text);
     DisposeHandle(d->lines);
     DisposePtr((Ptr)d);
@@ -1329,8 +1769,18 @@ static void DoInfo(WindowPtr w)
     b[0] = 0;
     NumToPStrSep(d->st.paragraphs, n); PCat(b, n); CCat(b, " paragraphs, ");
     NumToPStrSep(d->st.tables, n);     PCat(b, n); CCat(b, " tables, ");
-    NumToPStrSep(d->st.pictures, n);   PCat(b, n); CCat(b, " pictures (not shown), ");
+    NumToPStrSep(d->st.pictures, n);   PCat(b, n); CCat(b, " pictures, ");
     NumToPStrSep(d->nLines, n);        PCat(b, n); CCat(b, " lines.");
+    if (d->picCount > 0) {
+        CCat(b, " Pictures decoded so far: ");
+        NumToPStrSep(d->picCount, n);       PCat(b, n); CCat(b, ", in ");
+        NumToPStrSep(d->picTicks / 60, n);  PCat(b, n); CCat(b, ".");
+        NumToPStrSep((d->picTicks % 60) * 10 / 60, n); PCat(b, n);
+        CCat(b, " s (slowest ");
+        NumToPStrSep(d->picSlowest / 60, n); PCat(b, n); CCat(b, ".");
+        NumToPStrSep((d->picSlowest % 60) * 10 / 60, n); PCat(b, n);
+        CCat(b, " s).");
+    }
     if (d->truncated)
         CCat(b, " Truncated: not enough memory.");
 
@@ -1544,8 +1994,8 @@ static void DoKey(EventRecord *ev)
     switch (ch) {
     case 0x1E: ScrollTo(w, d->top - 1); break;                 /* up */
     case 0x1F: ScrollTo(w, d->top + 1); break;                 /* down */
-    case 0x0B: ScrollTo(w, d->top - PageLines(w)); break;      /* page up */
-    case 0x0C: case ' ': ScrollTo(w, d->top + PageLines(w)); break;
+    case 0x0B: ScrollTo(w, d->top - PageLines(w, -1)); break;  /* page up */
+    case 0x0C: case ' ': ScrollTo(w, d->top + PageLines(w, 1)); break;
     case 0x01: ScrollTo(w, 0); break;                          /* home */
     case 0x04: ScrollTo(w, d->maxTop); break;                  /* end */
     }
@@ -1647,6 +2097,28 @@ int main(void)
     InitCursor();
 
     gScrollUPP = NewControlActionUPP(ScrollAction);
+    {
+        long qdv;
+        if (Gestalt(gestaltQuickdrawVersion, &qdv) == noErr && qdv >= gestalt8BitQD) {
+            short i;
+            gGreyCT = (CTabHandle)NewHandleClear(sizeof(ColorTable) + 15 * sizeof(ColorSpec));
+            if (gGreyCT) {                      /* 16 greys, index 0 white */
+                gHasCQD = true;
+                (**gGreyCT).ctSeed = GetCTSeed();
+                (**gGreyCT).ctSize = 15;
+                for (i = 0; i < 16; i++) {
+                    ColorSpec *c = &(**gGreyCT).ctTable[i];
+                    c->value = i;
+                    c->rgb.red = c->rgb.green = c->rgb.blue = (unsigned short)(65535L - i * 4369L);
+                }
+                for (i = 0; i < 16; i++) {      /* ordered dither, no divide per pixel */
+                    long g;
+                    for (g = 0; g < 256; g++)
+                        gDither[i][g] = (unsigned char)(15 - (g * 240 + i * 255 + 127) / 4080);
+                }
+            }
+        }
+    }
     SetupMenus();
     SetBodySize(12);
     InstallAEs();
