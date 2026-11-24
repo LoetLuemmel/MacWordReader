@@ -1,10 +1,10 @@
-"""make_gif.py — stitch the recorded frames into gif/WordReader-making-of.gif.
+"""make_gif.py — stitch recorded frames into a GIF (gif/WordReader-Duo.gif).
 
-Frames come from gif/frames/dev2019 (framebuffer recorder) and gif/frames/duo
-(DuoShot helper); gif/storyboard.json says which frames to use, in what order,
-with which caption and for how long. Title cards are drawn here.
+Frames come from gif/frames/duo (DuoShot helper on the PowerBook Duo); the
+storyboard says which frames to use, in what order, with which caption and
+for how long. Title cards are drawn here.
   uv run --with pillow python tools/make_gif.py [storyboard.json [out.gif]]
-(both relative to gif/; default storyboard.json -> WordReader-making-of.gif)
+(both relative to gif/; default storyboard-duo.json -> WordReader-Duo.gif)
 """
 import json, os, sys
 from PIL import Image, ImageDraw, ImageFont
@@ -50,7 +50,7 @@ def frame(path, tag, caption, crop=None):
     return canvas
 
 
-FOOTER = "MacWordReader · MPW on System 7.6.1 · 2026-11-23"
+FOOTER = "github.com/LoetLuemmel/MacWordReader"
 
 
 def card(title, lines, footer=None):
@@ -68,8 +68,8 @@ def card(title, lines, footer=None):
 
 
 def main():
-    board = sys.argv[1] if len(sys.argv) > 1 else "storyboard.json"
-    name = sys.argv[2] if len(sys.argv) > 2 else "WordReader-making-of.gif"
+    board = sys.argv[1] if len(sys.argv) > 1 else "storyboard-duo.json"
+    name = sys.argv[2] if len(sys.argv) > 2 else "WordReader-Duo.gif"
     story = json.load(open(os.path.join(ROOT, board)))
     frames, durations = [], []
     for s in story:

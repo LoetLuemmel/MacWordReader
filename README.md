@@ -129,7 +129,7 @@ src/docx.c        WordprocessingML and OpenDocument → MacRoman text + formatti
 src/image.c       PNG and JPEG → grey rows at the shown size (box-filter scaler)
 src/main.c        the Mac application (menus, window, scrolling, AE, files)
 src/WordReader.r  menus, alerts, SIZE, BNDL/FREF, icons (src/icons.r generated)
-src/DuoShot.c     helper: screen → file via CopyBits (for the making-of GIF)
+src/DuoShot.c     helper: screen → file via CopyBits (for the GIF)
 tests/            host harness (wrcat), verification, fuzzing
 tools/            build on dev2019, deploy to the Duo, capture, GIF
 ```
