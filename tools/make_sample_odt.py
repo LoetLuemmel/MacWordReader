@@ -1,7 +1,7 @@
 """make_sample_odt.py — samples/Duo-Demo.odt, an OpenDocument test file built
 the way LibreOffice writes one: named styles with parents in styles.xml,
 automatic styles in content.xml, text:h headings, nested lists, a table,
-spans, text:s, line breaks, a footnote (not shown) and a comment (not shown)."""
+spans, text:s, line breaks, a footnote (shown after the text) and a comment (not shown)."""
 import os
 from odf.opendocument import OpenDocumentText
 from odf.style import Style, TextProperties, ParagraphProperties, DefaultStyle
@@ -54,7 +54,7 @@ para(body, "Normaler Text mit ", span(B, "fett"), ", ", span(I, "kursiv"), ", ",
 p = para(body, "Leerzeichen:"); p.addElement(S(c=4)); p.addText("vier, Tab:"); p.addElement(Tab()); p.addText("danach,")
 p.addElement(LineBreak()); p.addText("und nach einem Zeilenumbruch im selben Absatz.")
 fn = Note(noteclass="footnote"); nc = NoteCitation(); nc.addText("1"); fn.addElement(nc)
-nb = NoteBody(); nbp = P(stylename=body); nbp.addText("FUSSNOTENTEXT – wird nicht angezeigt"); nb.addElement(nbp); fn.addElement(nb)
+nb = NoteBody(); nbp = P(stylename=body); nbp.addText("Der Fußnotentext steht am Ende des Dokuments."); nb.addElement(nbp); fn.addElement(nb)
 p = para(body, "Ein Satz mit Fußnote"); p.addElement(fn); p.addText(" und Kommentar")
 ann = Annotation(); ap = P(); ap.addText("KOMMENTAR – wird nicht angezeigt"); ann.addElement(ap); p.addElement(ann); p.addText(".")
 para(indent, "Hängender Einzug: diese Zeile ist lang genug, um umzubrechen, und die Folgezeilen beginnen 1 cm vom Rand, die erste Zeile 0,5 cm.")

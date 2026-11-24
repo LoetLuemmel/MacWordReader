@@ -51,6 +51,7 @@ static long Write(void *ctx, const wr_u8 *b, long n)
         if (c == DOCX_PARA || c == DOCX_PIC) { need = c == DOCX_PARA ? DOCX_PARA_LEN - 1 : DOCX_PIC_HEAD - 1; got = 1; rec[0] = c; continue; }
         if (DOCX_IS_FACE(c)) { if (fmt) printf("{%s%s%s%s}", c == 0x10 ? "plain" : "", c & 1 ? "B" : "", c & 2 ? "I" : "", c & 4 ? "U" : ""); continue; }
         if (DOCX_IS_SIZE(c)) { if (fmt) printf("{s%+d}", c - DOCX_SIZE0 - 2); continue; }
+        if (DOCX_IS_SUP(c)) { putchar(c == DOCX_SUP_ON ? '[' : ']'); continue; }
         if (c == '\r' || c == DOCX_CH_LINEBREAK) { putchar('\n'); continue; }
         if (c == DOCX_CH_EURO) { fputs("\xE2\x82\xAC", stdout); continue; }
         if (DOCX_IS_MARKER(c)) { fputs(c == 1 ? "#T " : c == 2 ? "# " : c == 3 ? "## " : "### ", stdout); continue; }
@@ -157,9 +158,9 @@ int main(int argc, char **argv)
         return err;
     }
     err = docx_convert(&src, Write, 0, &st);
-    fprintf(stderr, "err=%d fmt=%d part=%s xml=%lu chars=%ld paras=%ld tables=%ld pics=%ld lossy=%ld subst=%ld euro=%ld\n",
+    fprintf(stderr, "err=%d fmt=%d part=%s xml=%lu chars=%ld paras=%ld tables=%ld pics=%ld fn=%ld en=%ld lossy=%ld subst=%ld euro=%ld\n",
             err, st.format, st.part, (unsigned long)st.xmlBytes, st.chars, st.paragraphs,
-            st.tables, st.pictures, st.lossy, st.substituted, st.euros);
+            st.tables, st.pictures, st.footnotes, st.endnotes, st.lossy, st.substituted, st.euros);
     fclose(f);
     return err;
 }
