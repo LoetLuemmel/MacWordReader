@@ -18,16 +18,15 @@ REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/"
 CT = "application/vnd.openxmlformats-officedocument.wordprocessingml."
 
 BODY = [
-    ("h", "Fußnoten und Endnoten"),
-    ("p", ["Der PowerBook Duo 230 kam 1992 heraus", ("f", "Vorgestellt im Oktober 1992, zusammen mit dem Duo 210."),
-           " und wog 1,9 kg", ("f", "Ohne Dock. Mit dem MiniDock kommen Anschlüsse für Monitor, SCSI und ADB dazu."),
+    ("h", "Footnotes and Endnotes"),
+    ("p", ["The PowerBook Duo 230 came out in 1992", ("f", "Introduced in October 1992, together with the Duo 210."),
+           " and weighed 1.9 kg", ("f", "Without a dock. The MiniDock adds ports for a monitor, SCSI and ADB."),
            "."]),
-    ("p", ["Sein Prozessor ist ein 68030", ("f", "Motorola MC68030, 33 MHz, ohne FPU – die gibt es erst im Dock."),
-           " mit 33 MHz. Quellen stehen am Ende", ("e", "Apple, Technical Introduction to the Macintosh Family."),
-           ", wie in einer Hausarbeit", ("e", "Und eine zweite Endnote, römisch gezählt."), "."]),
-    ("p", ["Ein Absatz ohne Anmerkung, damit man blättern kann."]),
+    ("p", ["Its processor is a 68030", ("f", "Motorola MC68030 at 33 MHz, without an FPU – that comes with the dock."),
+           " running at 33 MHz. Sources are listed at the end", ("e", "Apple, Technical Introduction to the Macintosh Family."),
+           ", as in a term paper", ("e", "And a second endnote, numbered in roman numerals."), "."]),
+    ("p", ["A paragraph without a note, so there is something to scroll."]),
 ]
-
 
 def note_xml(kind, nid, text):
     ref = "FootnoteReference" if kind == "f" else "EndnoteReference"
