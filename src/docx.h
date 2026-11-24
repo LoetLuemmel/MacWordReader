@@ -39,12 +39,22 @@
                          text (-2 .. +5); the viewer maps steps to real sizes
    DOCX_CH_LINEBREAK     a line break inside a paragraph (keeps its indent)
 
+   DOCX_PIC + 5 bytes + name
+                         a picture, alone on its line in the viewer: width
+                         and height in points (two bytes each, 0x20 + six
+                         bits, high first; 0 = unknown), the name's length
+                         (0x20 + n), then the package member holding it
+                         (printable ASCII, e.g. word/media/image1.png)
+
    Run face and size start at plain body text after every CR. */
 #define DOCX_PARA         0x06
 #define DOCX_PARA_LEN     6
 #define DOCX_FACE0        0x10
 #define DOCX_SIZE0        0x18
 #define DOCX_CH_LINEBREAK 0x0B
+#define DOCX_PIC          0x07
+#define DOCX_PIC_HEAD     6
+#define DOCX_PIC_NAMEMAX  90
 #define DOCX_IS_FACE(c)   ((c) >= 0x10 && (c) <= 0x17)
 #define DOCX_IS_SIZE(c)   ((c) >= 0x18 && (c) <= 0x1F)
 enum { DOCX_AL_LEFT = 0, DOCX_AL_CENTER, DOCX_AL_RIGHT, DOCX_AL_JUSTIFY };
@@ -82,6 +92,10 @@ enum {
 
 /* Length of the control item starting at t[i] (0: text). */
 long docx_ctrl_len(const wr_u8 *t, long i, long len);
+
+/* The picture item at t[i] (DOCX_PIC): size in points, member name as a
+   C string (name must hold DOCX_PIC_NAMEMAX + 1). Returns 0 if malformed. */
+short docx_pic_info(const wr_u8 *t, long i, long len, short *wPt, short *hPt, char *name);
 
 short docx_convert(WrSource *src, WrWriteFn wr, void *wctx, DocxStats *st);
 

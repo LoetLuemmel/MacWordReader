@@ -13,8 +13,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHARE = os.path.expanduser("~/Desktop/Share/WordReader")
 CONVERT = os.path.expanduser("~/Documents/Dev/AppleBridge_Working/host/encoding_convert.py")
 PROJ = "MeinMac:MPW:WordReader:"
-SOURCES = ["macroman.c", "inflate.c", "zipdir.c", "docx.c", "main.c"]
-TEXTS = SOURCES + ["wrplat.h", "macroman.h", "inflate.h", "zipdir.h", "docx.h",
+SOURCES = ["macroman.c", "inflate.c", "zipdir.c", "docx.c", "image.c", "main.c"]
+TEXTS = SOURCES + ["wrplat.h", "macroman.h", "inflate.h", "zipdir.h", "docx.h", "image.h",
                    "WordReader.r", "icons.r", "DuoShot.c", "DuoShot.r"]
 GUEST = "dev2019"
 
